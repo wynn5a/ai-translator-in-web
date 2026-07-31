@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>AI 划词翻译 · 设置</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fff; --ink: #1c1e21; --soft: #6b7280; --line: #dfe1e6;
+    --accent: #2f6fed; --ok: #12805c; --bad: #c4362c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1c1e22; --ink: #e6e8ea; --soft: #9aa1ab; --line: #33363c;
+      --accent: #6c9bff; --ok: #4ade9b; --bad: #ff7a6e; }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    width: 340px; margin: 0 auto; padding: 16px; background: var(--bg); color: var(--ink);
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+
+  h1 { margin: 0; font-size: 15px; font-weight: 600; }
+  .tagline { margin: 4px 0 16px; font-size: 12px; color: var(--soft); }
+  kbd { padding: 1px 4px; border: 1px solid var(--line); border-radius: 3px; font-family: inherit; font-size: 11px; }
+
+  label { display: block; margin-bottom: 4px; font-size: 12px; color: var(--soft); }
+  input[type="text"], input[type="password"], select {
+    width: 100%; padding: 6px 8px; margin-bottom: 10px;
+    border: 1px solid var(--line); border-radius: 4px;
+    background: transparent; color: inherit; font: inherit;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  input::placeholder { color: var(--soft); opacity: .6; }
+
+  .check { display: flex; align-items: center; gap: 7px; margin: 12px 0; font-size: 13px; color: var(--ink); }
+  .check input { margin: 0; accent-color: var(--accent); }
+
+  summary { cursor: pointer; font-size: 12px; color: var(--accent); margin-bottom: 8px; }
+  .hint { margin: 0 0 4px; font-size: 11px; color: var(--soft); }
+
+  .actions { display: flex; gap: 8px; margin-top: 14px; }
+  button { flex: 1; padding: 7px 0; border-radius: 4px; border: 1px solid var(--line);
+    background: transparent; color: inherit; font: inherit; cursor: pointer; }
+  button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+  .link { flex: none; padding: 0; border: 0; color: var(--accent); font-size: 11px; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  #status { margin-top: 10px; min-height: 30px; font-size: 12px; }
+  #status b { font-weight: 600; }
+  #status.ok b { color: var(--ok); }
+  #status.bad b { color: var(--bad); }
+  #status span { display: block; margin-top: 2px; color: var(--soft); word-break: break-word; user-select: text; }
+</style>
+</head>
+<body>
+  <h1>AI 划词翻译</h1>
+  <p class="tagline">选中文字或悬停段落，按 <kbd id="kbdHint">Ctrl</kbd> 取译文</p>
+
+  <label for="baseUrl">接口地址</label>
+  <input type="text" id="baseUrl" placeholder="https://api.openai.com/v1" spellcheck="false" />
+
+  <label for="apiKey">密钥 <button type="button" id="reveal" class="link">显示</button></label>
+  <input type="password" id="apiKey" placeholder="sk-..." spellcheck="false" />
+
+  <label for="model">模型</label>
+  <input type="text" id="model" placeholder="gpt-4o-mini" spellcheck="false" />
+
+  <label for="targetLang">目标语言</label>
+  <input type="text" id="targetLang" placeholder="简体中文" />
+
+  <label for="hotkey">触发键</label>
+  <select id="hotkey">
+    <option value="Control">Ctrl</option>
+    <option value="Alt">Alt</option>
+    <option value="Shift">Shift</option>
+  </select>
+
+  <label class="check"><input type="checkbox" id="noThink" />关闭模型思考，降低等待时间</label>
+
+  <details>
+    <summary>高级</summary>
+    <label for="extraBody">额外请求参数</label>
+    <input type="text" id="extraBody" placeholder='{"reasoning_effort":"none"}' spellcheck="false" />
+    <p class="hint">合并进请求体的 JSON，覆盖自动判断。</p>
+  </details>
+
+  <div class="actions">
+    <button type="button" class="primary" id="save">保存设置</button>
+    <button type="button" id="test">测试连接</button>
+  </div>
+  <div id="status" role="status" aria-live="polite"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "AI 划词翻译",
+  "version": "1.0.0",
+  "description": "选中文字或悬停段落后按 Ctrl，用 OpenAI 兼容模型即时翻译成中文。",
+  "minimum_chrome_version": "116",
+  "permissions": ["storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_ui": { "page": "options.html", "open_in_tab": true },
+  "action": { "default_popup": "options.html", "default_title": "AI 划词翻译设置" }
+}
