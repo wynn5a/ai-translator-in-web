@@ -81,9 +81,7 @@ const DOTS_CSS = `
 const PAGE_CSS = `${DOTS_CSS}
 [data-ai-tr-hover]{outline:2px solid rgba(47,111,237,.55)!important;outline-offset:2px!important;
   border-radius:3px;transition:outline-color .12s}
-[data-ai-translation]{border-left:2px solid rgba(128,128,128,.3);padding-left:.6em;
-  white-space:pre-wrap;opacity:.9}
-[data-ai-translation] .ai-tr-retry{all:unset;cursor:pointer;text-decoration:underline;font:inherit}`;
+.ai-tr-retry{all:unset;cursor:pointer;text-decoration:underline;font:inherit}`;
 
 let pageStyled = false;
 function injectPageCss() {
@@ -307,6 +305,14 @@ function existingTranslation(block) {
   return next?.dataset?.[MARK] ? next : null;
 }
 
+/** 用 <br> 还原换行，而不是给译文加 white-space —— 渲染样式必须和原文完全一致 */
+function fillText(el, text) {
+  const lines = text.split('\n');
+  el.replaceChildren(
+    ...lines.flatMap((line, i) => (i ? [document.createElement('br'), new Text(line)] : [new Text(line)]))
+  );
+}
+
 /** 创建承载译文的节点，使其与原文渲染样式一致 */
 function createTarget(block) {
   let el;
@@ -315,9 +321,9 @@ function createTarget(block) {
     block.append(el);
   } else {
     el = document.createElement(block.tagName);
-    el.className = block.className;
-    const style = block.getAttribute('style');
-    if (style) el.setAttribute('style', style);
+    // 原样搬过来，让页面 CSS 用同样的规则命中它；id 不能重复，行内事件不该复制
+    for (const { name, value } of block.attributes)
+      if (name !== 'id' && !name.startsWith('on')) el.setAttribute(name, value);
     block.after(el);
   }
   el.dataset[MARK] = '1';
@@ -362,7 +368,7 @@ async function runBlock(block, force) {
   const target = createTarget(block);
   target.replaceChildren(dots());
   const task = requestTranslation({ text: source }, (p) => {
-    if (target.isConnected) target.textContent = p;
+    if (target.isConnected) fillText(target, p);
     else task.cancel(); // 页面变化导致节点消失，停止请求
   });
   running.set(target, task);
@@ -371,7 +377,7 @@ async function runBlock(block, force) {
   running.delete(target);
   if (!target.isConnected) return;
   if (error) blockError(block, target, error, code);
-  else target.textContent = text;
+  else fillText(target, text);
 }
 
 /* ---------- 触发：单独按下并松开热键（组合键不触发） ---------- */
