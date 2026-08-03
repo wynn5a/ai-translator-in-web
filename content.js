@@ -1,15 +1,21 @@
 /* ================= 配置 ================= */
 
-const DEFAULTS = { hotkey: 'Control', targetLang: '简体中文', disabledHosts: [] };
-const cfg = { ...DEFAULTS };
+/* targetLang 跟着当前 profile 走，hotkey / disabledHosts 是全局的（见 config.js） */
+const cfg = { hotkey: 'Control', targetLang: '简体中文', disabledHosts: [] };
+const WATCHED = ['profiles', 'activeProfileId', 'hotkey', 'disabledHosts'];
 const HOST = location.hostname;
 let enabled = true;
 
-chrome.storage.local.get(DEFAULTS).then((v) => (Object.assign(cfg, v), syncEnabled()));
-chrome.storage.onChanged.addListener((c) => {
-  for (const k in c) if (k in cfg) cfg[k] = c[k].newValue;
-  if (c.disabledHosts) syncEnabled();
-});
+const applyConfig = ({ active, hotkey, disabledHosts }) => {
+  Object.assign(cfg, { hotkey, disabledHosts, targetLang: active.targetLang });
+  syncEnabled();
+};
+
+const reload = () => loadConfig().then(applyConfig);
+
+reload();
+// 译文缓存也写在 storage 里且写得很频繁，只有配置相关的键变化才重新读
+chrome.storage.onChanged.addListener((c) => WATCHED.some((k) => k in c) && reload());
 
 function syncEnabled() {
   enabled = !(cfg.disabledHosts || []).includes(HOST);

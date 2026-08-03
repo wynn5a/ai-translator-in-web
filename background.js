@@ -1,11 +1,4 @@
-const DEFAULTS = {
-  baseUrl: 'https://api.openai.com/v1',
-  apiKey: '',
-  model: 'gpt-4o-mini',
-  targetLang: '简体中文',
-  noThink: true,
-  extraBody: '',
-};
+importScripts('config.js'); // PROFILE_FIELDS / loadConfig / ensureProfiles
 
 const MAX_CONCURRENT = 10;
 const CACHE_KEY = '__cache';
@@ -103,11 +96,12 @@ function buildMessages(text, context, lang) {
 
 /** 逐块回调译文增量；返回完整译文 */
 async function translate(text, onChunk = () => {}, signal, context = '') {
-  const cfg = await chrome.storage.local.get(DEFAULTS);
+  const { active: cfg } = await loadConfig(); // 当前 profile，切换后下一次翻译立即生效
   if (!cfg.apiKey) throw fail('还没有配置 API Key', 'no-key');
 
   const c = await getCache();
-  const key = `${cfg.model}${cfg.targetLang}${context}${text}`;
+  // 端点也参与 key：两个 profile 用同名模型指向不同服务时，译文不能互相串
+  const key = [cfg.baseUrl, cfg.model, cfg.targetLang, context, text].join('\x01');
   const hit = c.get(key);
   if (hit !== undefined) {
     c.delete(key), c.set(key, hit); // 命中即刷新为最近使用
@@ -272,9 +266,10 @@ function createMenus() {
 
 chrome.runtime.onInstalled.addListener(({ reason }) => {
   createMenus();
+  ensureProfiles(); // 从 1.1 升级上来：旧的扁平配置变成「默认」profile
   if (reason === 'install') chrome.runtime.openOptionsPage(); // 装完直接进配置，不用先撞一次错误
 });
-chrome.runtime.onStartup.addListener(createMenus);
+chrome.runtime.onStartup.addListener(() => (createMenus(), ensureProfiles()));
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (!tab?.id) return;
