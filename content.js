@@ -120,6 +120,15 @@ const TIP_CSS = `
   border:1px solid currentColor;background:transparent;color:inherit;opacity:.7}
 .bar button:hover{opacity:1}`;
 
+/**
+ * 页面的 `!important` 规则会命中这个顶层 div（Jira 就把它变成 display:none），
+ * 宿主一旦不渲染，shadow 里的气泡连布局盒都没有，visibility 还会继承进去。
+ * 所以宿主样式必须用 !important 钉死：行内 !important 压得住页面的 !important。
+ */
+const HOST_CSS =
+  'all:initial!important;position:fixed!important;top:0!important;left:0!important;' +
+  'width:0!important;height:0!important;display:block!important;z-index:2147483647!important';
+
 let tipHost, tipEl, tipBody, tipBar;
 let anchor = null; // { rect() }
 let flip = null; // 首帧决定展开方向，流式追加时不再改变
@@ -128,7 +137,7 @@ let hintTimer;
 function ensureTip() {
   if (tipEl) return;
   tipHost = document.createElement('div');
-  tipHost.style.cssText = 'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647';
+  tipHost.style.cssText = HOST_CSS;
   const shadow = tipHost.attachShadow({ mode: 'open' });
   shadow.innerHTML =
     `<style>${TIP_CSS}${DOTS_CSS}</style>` +
@@ -140,6 +149,12 @@ function ensureTip() {
 }
 
 const rangeAnchor = (range) => ({ rect: () => range.getBoundingClientRect() });
+
+/** 选区节点被页面改动、拿不到矩形时的退路：锚在鼠标处 */
+let mouse = { x: innerWidth / 2, y: innerHeight / 2 };
+const pointAnchor = () => ({
+  rect: () => ({ left: mouse.x, right: mouse.x, top: mouse.y, bottom: mouse.y, width: 0 }),
+});
 
 /** 长段落的矩形很高，锚在它顶部一小段上，气泡才不会跑到屏幕外 */
 const blockAnchor = (block) => ({
@@ -177,8 +192,11 @@ function showTip(content, { error = false, hint = false, actions = [] } = {}) {
 
 function place() {
   if (!tipEl || tipEl.hidden) return;
-  const r = anchor?.rect();
-  if (!r || (!r.width && !r.top && !r.left)) return hideTip(); // 选区已失效
+  let r = anchor?.rect();
+  if (!r || (!r.width && !r.top && !r.left)) {
+    anchor = pointAnchor(); // 锚点失效（页面把选区节点换掉了）：退到鼠标处，不让气泡凭空消失
+    r = anchor.rect();
+  }
   if (r.bottom < 0 || r.top > innerHeight) {
     tipEl.style.visibility = 'hidden'; // 锚点滚出视口：藏起来但不中断翻译
     return;
@@ -279,16 +297,17 @@ function errorActions(code, retry) {
 
 /* ---------- 划词翻译 ---------- */
 
-async function runSelection(range, text) {
-  openAt(rangeAnchor(range));
-  const context = isTerm(text) ? sentenceAround(range) : '';
+/** range 可能为 null（选区节点已被页面替换，只剩文本） */
+async function runSelection(text, range) {
+  openAt(range ? rangeAnchor(range) : pointAnchor());
+  const context = range && isTerm(text) ? sentenceAround(range) : '';
   showTip(dots());
 
   const task = (pending = requestTranslation({ text, context }, (p) => pending === task && showTip(p)));
   const { text: out, error, code } = await task;
   if (pending !== task) return; // 已被 Esc / 点击 / 新的翻译取代
   pending = null;
-  if (error) showTip(error, { error: true, actions: errorActions(code, () => runSelection(range, text)) });
+  if (error) showTip(error, { error: true, actions: errorActions(code, () => runSelection(text, range)) });
   else showTip(out);
 }
 
@@ -391,7 +410,9 @@ let rightClicked = null;
 let armedAt = 0;
 let marked = null;
 
-const insideTip = (node) => !!tipHost && (node === tipHost || tipHost.contains(node));
+/** 事件 target 会被重定向到 host，但选区节点可能直接落在 shadow 树里 */
+const insideTip = (node) =>
+  !!tipHost && (node === tipHost || tipHost.contains(node) || node?.getRootNode?.()?.host === tipHost);
 
 function highlight(el) {
   if (marked === el) return;
@@ -405,10 +426,36 @@ function candidate() {
   return findBlock(hovered);
 }
 
+/* ---------- 选区缓存 ---------- */
+
+/**
+ * 页面自定义的划词菜单常会把选区收走：focus 到隐藏输入框、removeAllRanges()、
+ * 或在选区所在节点里插入菜单节点。此时 getSelection() 已经是空的，
+ * 但用户看到的仍是「我选了字」，所以记住最近一次有效选区作为退路。
+ */
+let saved = null; // { range, text, raw }
+
+function rememberSelection() {
+  const sel = getSelection();
+  if (!sel || sel.isCollapsed || insideTip(sel.anchorNode)) return; // 选区被收走时保留上一次
+  const text = sel.toString().trim(); // Selection 的文本是按渲染取的，跨段落带换行
+  if (!text) return;
+  const range = sel.getRangeAt(0).cloneRange();
+  saved = { range, text, raw: range.toString() }; // raw 只用来判断 range 还指着同一段文字
+}
+
+/** 当前该翻译的选区：优先实时选区，其次缓存；range 已失效时只保留文本 */
+function activeSelection() {
+  rememberSelection();
+  if (!saved) return null;
+  const { range, text, raw } = saved;
+  const alive = range.startContainer.isConnected && range.toString() === raw;
+  return alive ? saved : { range: null, text };
+}
+
 /** 按住热键期间高亮将被翻译的段落；有选区时走划词路径，不高亮 */
 function previewTarget() {
-  const sel = getSelection();
-  highlight(sel && !sel.isCollapsed ? null : candidate());
+  highlight(activeSelection() ? null : candidate());
 }
 
 function disarm() {
@@ -417,21 +464,32 @@ function disarm() {
 }
 
 function trigger() {
-  const sel = getSelection();
-  const selected = sel && !sel.isCollapsed ? sel.toString().trim() : '';
-  if (selected) {
-    const range = sel.getRangeAt(0);
-    if (alreadyTarget(selected)) return flash(rangeAnchor(range), `已经是${cfg.targetLang}`);
-    return runSelection(range, selected);
+  const sel = activeSelection();
+  if (sel) {
+    const anchor = sel.range ? rangeAnchor(sel.range) : pointAnchor();
+    if (alreadyTarget(sel.text)) return flash(anchor, `已经是${cfg.targetLang}`);
+    return runSelection(sel.text, sel.range);
   }
   const block = candidate();
-  if (!block) return;
+  if (!block) {
+    // 静默失败最难查：让用户知道热键收到了，只是鼠标底下没有可翻译的目标
+    if (hovered && !insideTip(hovered)) flash(pointAnchor(), '这里没找到可翻译的段落');
+    return;
+  }
   if (alreadyTarget(block.innerText)) return flash(blockAnchor(block), `已经是${cfg.targetLang}`);
   runBlock(block, false);
 }
 
-addEventListener('mouseover', (e) => ((hovered = e.target), armedAt && previewTarget()), true);
-addEventListener('mousedown', (e) => (insideTip(e.target) ? disarm() : (disarm(), hideTip())), true);
+addEventListener(
+  'mouseover',
+  (e) => ((hovered = e.target), (mouse = { x: e.clientX, y: e.clientY }), armedAt && previewTarget()),
+  true
+);
+// 捕获阶段先记下选区：页面菜单可能在自己的 mouseup 里就把选区收走了
+addEventListener('mouseup', rememberSelection, true);
+document.addEventListener('selectionchange', rememberSelection, true);
+// 新的点击 = 新的意图，缓存作废（若页面菜单特意保住了选区，实时选区仍在，不受影响）
+addEventListener('mousedown', (e) => (insideTip(e.target) ? disarm() : ((saved = null), disarm(), hideTip())), true);
 addEventListener('wheel', disarm, { capture: true, passive: true }); // Ctrl+滚轮缩放后松手不该触发
 addEventListener('contextmenu', (e) => ((rightClicked = e.target), disarm()), true);
 addEventListener('blur', disarm);
@@ -463,9 +521,8 @@ addEventListener(
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === 'translate-selection') {
-    const sel = getSelection();
-    const text = sel && !sel.isCollapsed ? sel.toString().trim() : '';
-    if (text) runSelection(sel.getRangeAt(0), text);
+    const sel = activeSelection();
+    if (sel) runSelection(sel.text, sel.range);
   } else if (msg?.type === 'translate-block') {
     const block = findBlock(rightClicked || hovered);
     if (block) runBlock(block, false);
