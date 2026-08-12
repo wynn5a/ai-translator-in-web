@@ -101,6 +101,9 @@
 
   <details>
     <summary>高级</summary>
+    <label class="check"><input type="checkbox" id="glossary" />长段落译完后抽取术语</label>
+    <p class="hint">记住本站已用过的译法，后续段落沿用，同一个词不会前后不一。每段会多花一次很短的请求；
+      查词结果和短译文入表不受此开关影响。</p>
     <label for="extraBody">额外请求参数</label>
     <input type="text" id="extraBody" placeholder='{"reasoning_effort":"none"}' spellcheck="false" />
     <p class="hint">合并进请求体的 JSON，覆盖自动判断。</p>
@@ -120,7 +123,7 @@
     <label class="check"><input type="checkbox" id="siteOn" />在 <code id="siteName"></code> 上启用</label>
   </div>
 
-  <button type="button" id="clearCache" class="link">清空译文缓存</button>
+  <button type="button" id="clearCache" class="link">清空译文缓存与术语表</button>
 
   <div class="actions">
     <button type="button" class="primary" id="save">保存设置</button>

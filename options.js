@@ -207,7 +207,7 @@ $('siteOn').onchange = async (e) => {
 
 $('clearCache').onclick = async () => {
   await chrome.runtime.sendMessage({ type: 'clearCache' });
-  say('ok', '译文缓存已清空');
+  say('ok', '译文缓存与术语表已清空');
 };
 
 /* ---------- 保存与测试 ---------- */

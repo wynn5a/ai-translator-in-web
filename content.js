@@ -23,9 +23,24 @@ function syncEnabled() {
 }
 
 const MARK = 'aiTranslation'; // → data-ai-translation
-const BLOCKS = /^(P|LI|BLOCKQUOTE|H[1-6]|DD|DT|TD|FIGCAPTION|PRE|ARTICLE|SECTION|MAIN|DIV)$/;
+// PRE 不在其中：代码块整体送去翻译只会毁掉它
+const BLOCKS = /^(P|LI|BLOCKQUOTE|H[1-6]|DD|DT|TD|FIGCAPTION|ARTICLE|SECTION|MAIN|DIV)$/;
 const LONG_TEXT = 2000; // 超过此长度的段落先确认再翻译
 const HOLD_MAX = 1200; // 按住热键超过此时长视为「另有用途」，不触发
+
+/* ---------- 页面背景：让模型知道这段文字属于什么主题，术语才不会跑偏 ---------- */
+
+const metaContent = (name) =>
+  document.querySelector(`meta[name="${name}"],meta[property="og:${name}"]`)?.content?.trim() || '';
+
+const tidy = (s, max) => s.replace(/\s+/g, ' ').trim().slice(0, max);
+
+/** 每次翻译时重新读：SPA 切换路由后标题和描述都会变 */
+const pageBrief = () => ({
+  site: location.hostname.replace(/^www\./, ''),
+  title: tidy(document.title || metaContent('title'), 120),
+  desc: tidy(metaContent('description'), 200),
+});
 
 /* ---------- 语种判断：与目标语言一致才跳过 ---------- */
 
@@ -62,7 +77,10 @@ function alreadyTarget(text) {
 
 /** 从鼠标所在节点向上找到最近的、含足量文字的块级元素 */
 function findBlock(node) {
-  for (let el = node?.nodeType === 3 ? node.parentElement : node; el && el !== document.body; el = el.parentElement) {
+  const from = node?.nodeType === 3 ? node.parentElement : node;
+  // 代码块和输入框不翻。行内 <code> 不在其中：停在它上面时仍该翻译它所在的段落
+  if (from?.closest?.('pre,textarea,[contenteditable]:not([contenteditable="false"])')) return null;
+  for (let el = from; el && el !== document.body; el = el.parentElement) {
     if (el.dataset?.[MARK] || !BLOCKS.test(el.tagName)) continue;
     if (getComputedStyle(el).display === 'inline') continue;
     const text = el.innerText?.trim();
@@ -309,7 +327,8 @@ async function runSelection(text, range) {
   const context = range && isTerm(text) ? sentenceAround(range) : '';
   showTip(dots());
 
-  const task = (pending = requestTranslation({ text, context }, (p) => pending === task && showTip(p)));
+  const job = { kind: context ? 'term' : 'text', text, context, page: pageBrief() };
+  const task = (pending = requestTranslation(job, (p) => pending === task && showTip(p)));
   const { text: out, error, code } = await task;
   if (pending !== task) return; // 已被 Esc / 点击 / 新的翻译取代
   pending = null;
@@ -330,12 +349,126 @@ function existingTranslation(block) {
   return next?.dataset?.[MARK] ? next : null;
 }
 
-/** 用 <br> 还原换行，而不是给译文加 white-space —— 渲染样式必须和原文完全一致 */
-function fillText(el, text) {
-  const lines = text.split('\n');
-  el.replaceChildren(
-    ...lines.flatMap((line, i) => (i ? [document.createElement('br'), new Text(line)] : [new Text(line)]))
-  );
+/* ---------- 行内结构：编码成占位标记发给模型，回来再还原成真实节点 ----------
+
+   直接发 innerText 会把链接、加粗、<code> 全拍平：译文丢掉所有链接，
+   模型还会去翻译 useState、--verbose 这类标识符。
+   所以送出去的是 `点击 <t1>设置</t1> 并运行 <x2/>` 这样的文本：
+     <tN>…</tN>  行内元素，内容要翻译，还原时套回原元素（保留 href/class）
+     <xN/>       不可翻译的整块，原样搬回
+   纯文本段落不带任何标记，开销为零。 */
+
+// 占位保护并原样克隆进译文。PRE 在列：外层 DIV 被选中时，里面的代码块不能被翻译
+const ATOMIC = /^(CODE|KBD|SAMP|VAR|TT|PRE|IMG|SVG|MATH|PICTURE|BUTTON|SELECT)$/;
+// 既不译也不克隆：重复渲染只会让 iframe/视频再加载一遍，表单控件也没有可译文字
+const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|IFRAME|VIDEO|AUDIO|OBJECT|EMBED|CANVAS|INPUT|TEXTAREA)$/;
+const TAG_RE = /<(\/?)([tx])(\d+)(\/?)>/g;
+
+/** 返回 { text, parts, tagged }；parts[N-1] 是编号 N 对应的原始元素 */
+function encodeInline(block) {
+  const parts = [];
+  let out = '';
+
+  const walk = (node) => {
+    for (const child of node.childNodes) {
+      if (child.nodeType === 3) {
+        out += child.data.replace(/\s+/g, ' ');
+        continue;
+      }
+      if (child.nodeType !== 1) continue;
+      if (child.dataset?.[MARK]) continue; // 已插入的译文：翻译外层块时不能把它也算进原文
+      const tag = child.tagName.toUpperCase(); // svg / math 的 tagName 是小写
+      if (SKIP.test(tag)) continue;
+      if (tag === 'BR') {
+        out += '\n';
+        continue;
+      }
+      const style = getComputedStyle(child);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      const inline = style.display.startsWith('inline') || style.display === 'contents';
+
+      // 不可翻译的元素，以及没有文字的行内元素（图标、装饰性 span）：整体保护
+      if (ATOMIC.test(tag) || (inline && !child.textContent.trim())) {
+        parts.push(child);
+        out += `<x${parts.length}/>`;
+        continue;
+      }
+      if (!inline) {
+        // 块级子元素：不加标记，只用换行保住段落边界（与 innerText 一致）
+        out += '\n';
+        walk(child);
+        out += '\n';
+        continue;
+      }
+      parts.push(child);
+      const n = parts.length;
+      out += `<t${n}>`;
+      walk(child);
+      out += `</t${n}>`;
+    }
+  };
+  walk(block);
+
+  const text = out
+    .replace(/[ \t]*\n[ \t]*/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/ {2,}/g, ' ')
+    .trim();
+  return { text, parts, tagged: parts.length > 0 };
+}
+
+const visibleLength = (text) => text.replace(TAG_RE, '').length;
+
+/** 克隆行内元素时去掉 id 和行内事件：id 不能重复，页面的 onclick 也不该跟着复制一份 */
+function sanitize(node) {
+  if (node.nodeType === 1) {
+    node.removeAttribute('id');
+    for (const { name } of [...node.attributes]) if (name.startsWith('on')) node.removeAttribute(name);
+    for (const child of node.children) sanitize(child);
+  }
+  return node;
+}
+
+/**
+ * 把译文还原成节点填进 el。换行用 <br>，而不是给译文加 white-space ——
+ * 渲染样式必须和原文完全一致。
+ * 流式过程中标记可能还没闭合，一律宽容处理：认不出的标记就当它不存在，
+ * 最坏情况退化成纯文本（文字仍然完整，只是丢了链接）。
+ */
+function render(el, text, parts = []) {
+  const frag = document.createDocumentFragment();
+  const stack = [frag];
+  const push = (node) => stack[stack.length - 1].append(node);
+  const emit = (s) => {
+    if (!s) return;
+    s.split('\n').forEach((line, i) => {
+      if (i) push(document.createElement('br'));
+      if (line) push(new Text(line));
+    });
+  };
+
+  let last = 0;
+  for (const m of text.matchAll(TAG_RE)) {
+    emit(text.slice(last, m.index));
+    last = m.index + m[0].length;
+    const [, close, kind, num, selfClose] = m;
+    const src = parts[+num - 1];
+    if (!src) continue; // 编号是模型编出来的，没有对应元素就丢掉标记
+    if (kind === 'x' || selfClose) {
+      push(sanitize(src.cloneNode(true)));
+      continue;
+    }
+    if (close) {
+      if (stack.length > 1) stack.pop();
+      continue;
+    }
+    const wrap = sanitize(src.cloneNode(false)); // 浅克隆：保留 href/class，内容由译文填
+    push(wrap);
+    stack.push(wrap);
+  }
+  // 尾部可能是半个标记（`<t1` 还没传完），别把它当正文显示出来
+  emit(text.slice(last).replace(/<\/?[tx]?\d*\/?$/, ''));
+  el.replaceChildren(frag);
 }
 
 /** 创建承载译文的节点，使其与原文渲染样式一致 */
@@ -380,11 +513,12 @@ async function runBlock(block, force) {
     return done.remove();
   }
 
-  const source = block.innerText.trim(); // 必须在插入占位节点之前取
+  const { text: source, parts, tagged } = encodeInline(block); // 必须在插入占位节点之前取
   if (!source) return;
-  if (!force && source.length > LONG_TEXT) {
+  const size = visibleLength(source);
+  if (!force && size > LONG_TEXT) {
     openAt(blockAnchor(block));
-    return showTip(`这段有 ${source.length} 字，翻译会消耗较多额度。`, {
+    return showTip(`这段有 ${size} 字，翻译会消耗较多额度。`, {
       hint: true,
       actions: [{ label: '继续翻译', onClick: () => (hideTip(), runBlock(block, true)) }],
     });
@@ -392,8 +526,9 @@ async function runBlock(block, force) {
 
   const target = createTarget(block);
   target.replaceChildren(dots());
-  const task = requestTranslation({ text: source }, (p) => {
-    if (target.isConnected) fillText(target, p);
+  const job = { kind: 'block', text: source, tagged, page: pageBrief() };
+  const task = requestTranslation(job, (p) => {
+    if (target.isConnected) render(target, p, parts);
     else task.cancel(); // 页面变化导致节点消失，停止请求
   });
   running.set(target, task);
@@ -402,7 +537,7 @@ async function runBlock(block, force) {
   running.delete(target);
   if (!target.isConnected) return;
   if (error) blockError(block, target, error, code);
-  else fillText(target, text);
+  else render(target, text, parts);
 }
 
 /* ---------- 触发：单独按下并松开热键（组合键不触发） ---------- */

@@ -4,11 +4,12 @@
    可以随时切换。触发键和站点开关是全局的，不随 profile 变。
 
    存储结构（chrome.storage.local）：
-     profiles         [{ id, name, baseUrl, apiKey, model, targetLang, noThink, extraBody }]
+     profiles         [{ id, name, baseUrl, apiKey, model, targetLang, noThink, glossary, extraBody }]
      activeProfileId  当前生效的 profile id
      hotkey           触发键
      disabledHosts    停用的域名
      __cache          译文缓存（见 background.js）
+     __glossary       术语表，按「站点 + 目标语言」分组（见 background.js）
 
    本文件在后台、内容脚本、设置页三处都以普通脚本加载，只向全局暴露下面这些名字。 */
 
@@ -18,6 +19,7 @@ const PROFILE_FIELDS = {
   model: 'gpt-4o-mini',
   targetLang: '简体中文',
   noThink: true,
+  glossary: true,
   extraBody: '',
 };
 
@@ -38,11 +40,12 @@ const pick = (src, shape) =>
 
 /** 从存储原样还原出 { profiles, active, hotkey, disabledHosts }，不写入 */
 function resolveConfig(raw) {
-  const profiles =
-    Array.isArray(raw.profiles) && raw.profiles.length
-      ? raw.profiles
-      : // 还没有 profile：把旧版的扁平配置（或纯默认值）当作第一个 profile
-        [{ id: FIRST_PROFILE_ID, name: '默认', ...pick(raw, PROFILE_FIELDS) }];
+  const stored = Array.isArray(raw.profiles) && raw.profiles.length ? raw.profiles : null;
+  const profiles = stored
+    ? // 补齐缺失字段：早先版本存下的 profile 里没有后来新增的项，读出来时统一填默认值
+      stored.map((p) => ({ id: p.id, name: p.name, ...pick(p, PROFILE_FIELDS) }))
+    : // 还没有 profile：把旧版的扁平配置（或纯默认值）当作第一个 profile
+      [{ id: FIRST_PROFILE_ID, name: '默认', ...pick(raw, PROFILE_FIELDS) }];
   const active = profiles.find((p) => p.id === raw.activeProfileId) || profiles[0];
   return { profiles, active, ...pick(raw, GLOBAL_FIELDS) };
 }
