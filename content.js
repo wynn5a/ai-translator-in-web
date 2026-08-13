@@ -142,7 +142,16 @@ const TIP_CSS = `
 .bar[hidden]{display:none}
 .bar button{font:inherit;font-size:12px;line-height:1.4;padding:3px 10px;border-radius:6px;cursor:pointer;
   border:1px solid currentColor;background:transparent;color:inherit;opacity:.7}
-.bar button:hover{opacity:1}`;
+.bar button:hover{opacity:1}
+/* 发音按钮跟在译文末尾，和文字同一行，不占一整行 */
+.speak{display:inline-flex;vertical-align:-3px;margin-left:6px;padding:2px;line-height:0;
+  border:0;border-radius:4px;background:transparent;color:inherit;opacity:.55;cursor:pointer;
+  user-select:none} /* 气泡是 user-select:text，会继承进来：按在按钮上就等于在这里起一个新选区 */
+.speak:hover{opacity:1;background:rgba(128,128,128,.2)}
+.speak:disabled{cursor:default;opacity:.3;background:transparent}
+.speak.bad{color:#ff8a80;opacity:1}
+@media (prefers-color-scheme:light){.speak.bad{color:#c4362c}}
+.speak svg{display:block;width:16px;height:16px}`;
 
 /**
  * 页面的 `!important` 规则会命中这个顶层 div（Jira 就把它变成 display:none），
@@ -194,11 +203,12 @@ function openAt(a) {
   flip = null;
 }
 
-/** content 可以是字符串或 DOM 节点（加载动画） */
-function showTip(content, { error = false, hint = false, actions = [] } = {}) {
+/** content 可以是字符串或 DOM 节点（加载动画）；inline 是跟在正文末尾的按钮 */
+function showTip(content, { error = false, hint = false, actions = [], inline = null } = {}) {
   ensureTip();
-  if (typeof content === 'string') tipBody.textContent = content;
+  if (typeof content === 'string') tipBody.textContent = content.replace(/\s+$/, ''); // 末尾空行会把 inline 按钮挤到下一行
   else tipBody.replaceChildren(content);
+  if (inline) tipBody.append(inline);
   tipEl.classList.toggle('err', error);
   tipEl.classList.toggle('hint', hint);
   tipBar.replaceChildren(
@@ -290,6 +300,46 @@ function sentenceAround(range) {
   return sentence.length > end - at ? sentence.slice(0, 600) : '';
 }
 
+/* ---------- 发音：只给单词和短语，读原文 ---------- */
+
+// detectScript 认出的语种 → Google TTS 的 tl 参数
+const TTS_LANG = { zh: 'zh-CN', ja: 'ja', ko: 'ko', ru: 'ru', en: 'en' };
+const TTS_LIMIT = 200; // 与后台一致：端点对更长的文本直接报错
+
+/** 认不出语种（纯数字、符号）就不给按钮：读出来也不对 */
+const speakLang = (text) => (isTerm(text) && text.length <= TTS_LIMIT ? TTS_LANG[detectScript(text)] || '' : '');
+
+// 喇叭：跟着 currentColor 走，深浅色主题都不用换图
+const SPEAKER_SVG =
+  '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" ' +
+  'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M4 7.5h2.2L10 4.2v11.6L6.2 12.5H4a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1Z"/>' +
+  '<path d="M13.2 7.4a3.6 3.6 0 0 1 0 5.2"/>' +
+  '<path d="M15.6 5.2a6.8 6.8 0 0 1 0 9.6"/></svg>';
+
+function speakButton(text, lang) {
+  const btn = document.createElement('button');
+  btn.className = 'speak';
+  btn.title = '朗读原文';
+  btn.setAttribute('aria-label', '朗读原文');
+  btn.innerHTML = SPEAKER_SVG; // 固定的自有标记，不含任何页面内容
+  // 按钮在 shadow 树里，按下鼠标会把文档选区挪到这儿来，页面上选中的词随之消失。
+  // 拦掉 mousedown 的默认动作，选区和焦点都留在原处，click 照样会来
+  btn.onmousedown = (e) => e.preventDefault();
+  btn.onclick = async () => {
+    btn.disabled = true;
+    btn.classList.remove('bad');
+    const res = await chrome.runtime
+      .sendMessage({ type: 'speak', text, lang })
+      .catch(() => ({ error: '扩展已更新或被禁用，请刷新页面后重试' }));
+    btn.disabled = false;
+    if (!res?.error) return (btn.title = '朗读原文');
+    btn.classList.add('bad'); // 气泡正文是译文，不能被一句报错顶掉
+    btn.title = res.error;
+  };
+  return btn;
+}
+
 /* ---------- 后台通信（流式） ---------- */
 
 function requestTranslation(payload, onPartial) {
@@ -332,8 +382,10 @@ async function runSelection(text, range) {
   const { text: out, error, code } = await task;
   if (pending !== task) return; // 已被 Esc / 点击 / 新的翻译取代
   pending = null;
-  if (error) showTip(error, { error: true, actions: errorActions(code, () => runSelection(text, range)) });
-  else showTip(out);
+  if (error) return showTip(error, { error: true, actions: errorActions(code, () => runSelection(text, range)) });
+  // 只挂在最终译文上：流式过程中每个分片都会重建正文，按钮会一直闪
+  const lang = speakLang(text);
+  showTip(out, { inline: lang ? speakButton(text, lang) : null });
 }
 
 /* ---------- 段落翻译：复制原段落样式插入译文 ---------- */

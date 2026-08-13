@@ -39,6 +39,8 @@
   .row button { flex: none; width: 30px; padding: 0; line-height: 1; }
   .row button[disabled] { opacity: .4; cursor: default; }
   #delProfile.arm { border-color: var(--bad); color: var(--bad); width: auto; padding: 0 8px; font-size: 11px; }
+  #loadModels.busy { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   .divider { margin: 16px 0 12px; border-top: 1px solid var(--line); }
   .divider span { display: block; margin-top: -7px; padding-right: 6px;
@@ -92,7 +94,12 @@
   <input type="password" id="apiKey" placeholder="sk-..." spellcheck="false" />
 
   <label for="model">模型</label>
-  <input type="text" id="model" placeholder="gpt-4o-mini" spellcheck="false" />
+  <div class="row">
+    <select id="model"></select>
+    <button type="button" id="loadModels" title="重新获取模型列表">↻</button>
+  </div>
+  <input type="text" id="modelCustom" placeholder="gpt-4o-mini" spellcheck="false" hidden />
+  <p class="hint" id="modelHint"></p>
 
   <label for="targetLang">目标语言</label>
   <input type="text" id="targetLang" placeholder="简体中文" />

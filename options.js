@@ -40,6 +40,117 @@ function showHotkey(key) {
   $('hotkeyHint').textContent = HOTKEY_HINT[key];
 }
 
+/* ---------- 模型列表 ----------
+
+   OpenAI 兼容端点都带 GET /models，所以模型是选出来的，不用手抄名字。
+   但中转站的这张表并不总是可靠（缺接口、列一堆用不了的名字），
+   所以下拉框末尾永远留一个「手动输入」，且当前已选的模型无论在不在表里都保留。 */
+
+const CUSTOM = '__custom__'; // 不会和真实模型名相撞
+const MODELS_TIMEOUT = 10000;
+const MODELS_HINT = { 401: '密钥无效或已过期', 403: '无权访问', 404: '这个地址没有 /models 接口' };
+// 同一张表里常混着嵌入、语音、画图等模型，翻译用不上
+const NOT_CHAT = /embed|whisper|tts|speech|audio|image|dall-?e|moderation|rerank|davinci|babbage/i;
+
+const modelCache = new Map(); // `${baseUrl}\n${apiKey}` → 模型名数组
+const modelKey = () => `${$('baseUrl').value.trim()}\n${$('apiKey').value.trim()}`;
+const modelHint = (text) => ($('modelHint').textContent = text);
+const getModel = () => ($('model').value === CUSTOM ? $('modelCustom').value.trim() : $('model').value);
+
+async function fetchModels(baseUrl, apiKey) {
+  const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/models`, {
+    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    signal: AbortSignal.timeout(MODELS_TIMEOUT),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    let detail = body.slice(0, 120);
+    try {
+      detail = JSON.parse(body)?.error?.message || detail;
+    } catch {}
+    throw new Error(MODELS_HINT[res.status] || `HTTP ${res.status}${detail ? `：${detail}` : ''}`);
+  }
+  const raw = await res.json();
+  const all = [
+    ...new Set(
+      (Array.isArray(raw) ? raw : raw?.data || raw?.models || [])
+        .map((m) => (typeof m === 'string' ? m : m?.id || m?.name))
+        .filter((s) => typeof s === 'string' && s.trim())
+    ),
+  ].sort((a, b) => a.localeCompare(b, 'en'));
+  if (!all.length) throw new Error('返回的列表是空的');
+  const chat = all.filter((m) => !NOT_CHAT.test(m));
+  return chat.length ? chat : all; // 过滤把整张表滤空了，说明这些名字不按常规命名，那就全给出来
+}
+
+/** 重建下拉框：表里的模型 + 当前值（可能不在表里）+ 手动输入 */
+function renderModels(list, selected) {
+  const names = [...new Set(selected ? [...list, selected] : list)].sort((a, b) => a.localeCompare(b, 'en'));
+  const sel = $('model');
+  sel.replaceChildren(
+    ...names.map((m) => {
+      const o = document.createElement('option');
+      o.value = m;
+      o.textContent = m;
+      return o;
+    })
+  );
+  const custom = document.createElement('option');
+  custom.value = CUSTOM;
+  custom.textContent = '手动输入…';
+  sel.append(custom);
+  sel.value = names.includes(selected) ? selected : names[0] ?? CUSTOM;
+  $('modelCustom').hidden = sel.value !== CUSTOM;
+}
+
+let loadSeq = 0; // 并发的几次获取里只认最后发起的那一次
+
+/** force：忽略缓存，用户点了 ↻ */
+async function loadModels(force) {
+  const baseUrl = $('baseUrl').value.trim();
+  const apiKey = $('apiKey').value.trim();
+  const key = modelKey();
+  const keep = getModel();
+
+  const cached = modelCache.get(key);
+  if (cached && !force) {
+    renderModels(cached, keep);
+    return modelHint(`共 ${cached.length} 个模型`);
+  }
+  if (!baseUrl || (!apiKey && !force)) return modelHint('填好接口地址和密钥后自动获取模型列表');
+
+  const seq = ++loadSeq;
+  $('loadModels').classList.add('busy');
+  modelHint('正在获取模型列表…');
+  try {
+    const list = await fetchModels(baseUrl, apiKey);
+    if (seq !== loadSeq) return; // 期间又改了地址或换了配置
+    modelCache.set(key, list);
+    renderModels(list, keep);
+    modelHint(`共 ${list.length} 个模型`);
+  } catch (e) {
+    if (seq !== loadSeq) return;
+    renderModels([], keep); // 拿不到表也要能继续用原来的模型
+    modelHint(`获取模型列表失败（${errText(e)}），可选「手动输入」`);
+  } finally {
+    if (seq === loadSeq) $('loadModels').classList.remove('busy');
+  }
+}
+
+const errText = (e) =>
+  e.name === 'TimeoutError' ? '超时' : e.name === 'TypeError' ? '连不上这个接口地址' : e.message;
+
+$('model').onchange = () => {
+  const custom = $('model').value === CUSTOM;
+  $('modelCustom').hidden = !custom;
+  if (custom) $('modelCustom').focus();
+};
+
+$('loadModels').onclick = () => loadModels(true);
+// 换了地址或密钥就是换了一家服务商，列表跟着换
+$('baseUrl').onchange = () => loadModels(false);
+$('apiKey').onchange = () => loadModels(false);
+
 /* ---------- profile ---------- */
 
 let profiles = [];
@@ -71,10 +182,12 @@ function renderProfiles() {
 function fillForm(p) {
   $('name').value = p.name;
   for (const k in PROFILE_FIELDS) {
+    if (k === 'model') continue; // 下拉框里未必有这个 option，交给 renderModels
     const el = $(k);
     if (el.type === 'checkbox') el.checked = p[k];
     else el.value = p[k];
   }
+  renderModels(modelCache.get(modelKey()) ?? [], p.model);
 }
 
 /** 读表单；额外参数不是合法 JSON 时返回 null 并给出提示 */
@@ -94,6 +207,7 @@ function readForm() {
     p[k] = el.type === 'checkbox' ? el.checked : el.value.trim() || PROFILE_FIELDS[k];
   }
   p.extraBody = extra;
+  p.model = getModel() || PROFILE_FIELDS.model;
   return p;
 }
 
@@ -118,6 +232,7 @@ ensureProfiles().then((cfg) => {
   showHotkey(cfg.hotkey);
   renderProfiles();
   fillForm(cfg.active);
+  loadModels(false);
 });
 
 // 切换配置：先把当前编辑内容存进原 profile，避免切走就丢
@@ -130,6 +245,7 @@ $('profile').onchange = async (e) => {
   await persist();
   renderProfiles(); // 原 profile 可能刚被改了名字
   fillForm(current());
+  loadModels(false); // 这套配置可能指向另一家服务商
   say('ok', `已切换到「${current().name}」`, '下一次翻译就用这套配置');
 };
 

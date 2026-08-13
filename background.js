@@ -539,6 +539,41 @@ async function readJson(res, onChunk) {
   return out;
 }
 
+/* ---------- 单词发音：Google TTS 取音频，交给 offscreen 页播放 ----------
+
+   用的是 translate.google.com 的非官方端点：不要 key，但会限流，也可能哪天就变。
+   所以发音失败只回一句话给气泡上的按钮，翻译本身不受影响。 */
+
+const TTS_LIMIT = 200; // 再长这个端点直接返回 400
+
+const ttsUrl = (text, lang) =>
+  'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob' +
+  `&tl=${encodeURIComponent(lang)}&q=${encodeURIComponent(text)}`;
+
+let creatingOffscreen = null; // 连点两次会并发建文档，第二次必然报错
+
+async function ensureOffscreen() {
+  if (await chrome.offscreen.hasDocument()) return;
+  creatingOffscreen ??= chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['AUDIO_PLAYBACK'],
+    justification: '播放选中单词的发音',
+  });
+  try {
+    await creatingOffscreen;
+  } finally {
+    creatingOffscreen = null;
+  }
+}
+
+async function speak(text, lang) {
+  if (!text || !lang) throw new Error('这段文字无法发音');
+  if (text.length > TTS_LIMIT) throw new Error('这段文字太长，无法发音');
+  await ensureOffscreen();
+  const res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'play', url: ttsUrl(text, lang) });
+  if (res?.error) throw new Error(res.error);
+}
+
 /* ---------- 与内容脚本 / 设置页通信 ---------- */
 
 /* 流式通道：内容脚本连接后发一条 job，收到若干 {chunk} 后以 {done} 或 {error} 结束 */
@@ -562,7 +597,14 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.target === 'offscreen') return false; // 发给播放页的消息，这里不管
   switch (msg?.type) {
+    case 'speak': // 气泡上的喇叭按钮
+      speak(msg.text, msg.lang).then(
+        () => sendResponse({ ok: true }),
+        (err) => sendResponse({ error: err.message })
+      );
+      return true;
     case 'translate': // 设置页「测试连接」
       translate({ kind: 'text', text: msg.text }).then(
         (text) => sendResponse({ text }),
