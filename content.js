@@ -401,30 +401,62 @@ function existingTranslation(block) {
   return next?.dataset?.[MARK] ? next : null;
 }
 
-/* ---------- 行内结构：编码成占位标记发给模型，回来再还原成真实节点 ----------
+/* ---------- 结构：编码成占位标记发给模型，回来再还原成真实节点 ----------
 
    直接发 innerText 会把链接、加粗、<code> 全拍平：译文丢掉所有链接，
-   模型还会去翻译 useState、--verbose 这类标识符。
+   模型还会去翻译 useState、--verbose 这类标识符；多个段落只用换行分隔的话，
+   模型十有八九把它们揉成一段。
    所以送出去的是 `点击 <t1>设置</t1> 并运行 <x2/>` 这样的文本：
+     <bN>…</bN>  块级子元素（段落、列表项），还原时套回原元素，分段与段间距原样保留
+     <nN/>       换行（<br>，或 white-space 保留换行时文本里真实的 \n）
      <tN>…</tN>  行内元素，内容要翻译，还原时套回原元素（保留 href/class）
      <xN/>       不可翻译的整块，原样搬回
-   纯文本段落不带任何标记，开销为零。 */
+   分段一律走标记而不是裸换行：标记有编号也有数量约束，模型不敢动；
+   裸换行它说合就合。单个纯文本段落不带任何标记，开销为零。 */
 
 // 占位保护并原样克隆进译文。PRE 在列：外层 DIV 被选中时，里面的代码块不能被翻译
 const ATOMIC = /^(CODE|KBD|SAMP|VAR|TT|PRE|IMG|SVG|MATH|PICTURE|BUTTON|SELECT)$/;
 // 既不译也不克隆：重复渲染只会让 iframe/视频再加载一遍，表单控件也没有可译文字
 const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|IFRAME|VIDEO|AUDIO|OBJECT|EMBED|CANVAS|INPUT|TEXTAREA)$/;
-const TAG_RE = /<(\/?)([tx])(\d+)(\/?)>/g;
+const TAG_RE = /<(\/?)([txbn])(\d+)(\/?)>/g;
+// 这些 white-space 下换行是内容而不是排版空白：X 的推文整条就是一个元素，段落全靠它撑开
+const PRE_NL = /^(pre|pre-wrap|pre-line|break-spaces)/;
+// 弹性/网格容器的子项 computed display 会被强制成 block，但它并不换行，不能当块级处理
+const FLEX = /flex|grid/;
+// 模型常「好心」把 <n1/> 换成真正的 <br>，当它是换行标记，别把标签当正文显示出来
+const HTML_BR = /<\s*br\s*\/?\s*>/gi;
+// 标记也会被打歪：<n4 />、</n4>、多一个尖括号的 <n4/>>。先归一成规范写法，
+// 否则严格的 TAG_RE 只认走其中一段，剩下的尖括号就当正文显示出来了。
+// 尖括号和斜杠附近容许空白，字母和数字之间不容许：正文里的 `a < b 3 >` 不会被误伤。
+// 换行标记大小写都认——模型只在这一类上出错，而正文里几乎不可能出现 <N1/>；
+// 其余标记只认小写，否则正文里的 List<T1> 会被当成标记吞掉
+const SLOPPY_BREAK = /<+\s*\/?\s*[nN](\d+)\s*\/?\s*>+/g;
+const SLOPPY_TAG = /<+\s*(\/?)\s*([txb])(\d+)\s*(\/?)\s*>+/g;
+// 分段标记周围的换行只是发给模型时的排版，还原时要去掉，否则空行翻倍
+const BREAK_TAG = '(?:<\\/?b\\d+>|<\\/?n\\d+\\/?>)'; // 换行标记的斜杠模型爱丢，丢了也当它是
+// 换行最多吃一个（模型自己多打的空行留着，宁可多一行也不少一行），
+// 紧贴标记的空格一律吃掉：标记就是行边界，那里的空格只会变成行首/行尾的多余空白
+const NL_BEFORE_BREAK = new RegExp(`[^\\S\\n]*\\n?[^\\S\\n]*(${BREAK_TAG})`, 'g');
+const NL_AFTER_BREAK = new RegExp(`(${BREAK_TAG})[^\\S\\n]*\\n?[^\\S\\n]*`, 'g');
 
 /** 返回 { text, parts, tagged }；parts[N-1] 是编号 N 对应的原始元素 */
 function encodeInline(block) {
   const parts = [];
+  let breaks = 0; // 换行标记单独编号：它不对应任何元素，还原时直接给一个 <br>
   let out = '';
 
-  const walk = (node) => {
+  // 换行一律走标记：裸换行模型说合就合，带编号的标记有数量约束，它不敢动。
+  // 后面跟一个 \n 只是让发出去的原文还能一眼看出分段，还原时去掉
+  const newline = () => `<n${++breaks}/>\n`;
+
+  const walk = (node, parent) => {
     for (const child of node.childNodes) {
       if (child.nodeType === 3) {
-        out += child.data.replace(/\s+/g, ' ');
+        // white-space 保留换行时，文本里的 \n 是作者分的段（X 的推文正是如此），
+        // 跟着 \s+ 一起压成空格的话，原文送出去时就已经没有分段了
+        out += parent.pre
+          ? child.data.replace(/[^\S\n]+/g, ' ').replace(/\n/g, newline)
+          : child.data.replace(/\s+/g, ' ');
         continue;
       }
       if (child.nodeType !== 1) continue;
@@ -432,12 +464,15 @@ function encodeInline(block) {
       const tag = child.tagName.toUpperCase(); // svg / math 的 tagName 是小写
       if (SKIP.test(tag)) continue;
       if (tag === 'BR') {
-        out += '\n';
+        out += newline();
         continue;
       }
       const style = getComputedStyle(child);
       if (style.display === 'none' || style.visibility === 'hidden') continue;
-      const inline = style.display.startsWith('inline') || style.display === 'contents';
+      // 弹性/网格子项的 display 被强行改成了 block，可它并不换行：跟着父容器判断，
+      // 否则 X 里 @某人 这种 flex 壳子会被当成一个段落，译文平白多出两个换行
+      const inline =
+        parent.flex || style.display.startsWith('inline') || style.display === 'contents';
 
       // 不可翻译的元素，以及没有文字的行内元素（图标、装饰性 span）：整体保护
       if (ATOMIC.test(tag) || (inline && !child.textContent.trim())) {
@@ -445,21 +480,33 @@ function encodeInline(block) {
         out += `<x${parts.length}/>`;
         continue;
       }
+      const ctx = { pre: PRE_NL.test(style.whiteSpace), flex: FLEX.test(style.display) };
       if (!inline) {
-        // 块级子元素：不加标记，只用换行保住段落边界（与 innerText 一致）
-        out += '\n';
-        walk(child);
-        out += '\n';
+        // 没有文字的块（只有图片、装饰）不编号：套回去也没有可译的内容，
+        // 里面的图片会在 walk 里各自变成 <xN/>
+        if (!child.textContent.trim()) {
+          out += newline();
+          walk(child, ctx);
+          out += newline();
+          continue;
+        }
+        // 块级子元素：编号送出去，还原时套回原元素，分段和段间距都不会丢
+        parts.push(child);
+        const b = parts.length;
+        out += `\n<b${b}>`;
+        walk(child, ctx);
+        out += `</b${b}>\n`;
         continue;
       }
       parts.push(child);
       const n = parts.length;
       out += `<t${n}>`;
-      walk(child);
+      walk(child, ctx);
       out += `</t${n}>`;
     }
   };
-  walk(block);
+  const root = getComputedStyle(block);
+  walk(block, { pre: PRE_NL.test(root.whiteSpace), flex: FLEX.test(root.display) });
 
   const text = out
     .replace(/[ \t]*\n[ \t]*/g, '\n')
@@ -488,6 +535,14 @@ function sanitize(node) {
  * 最坏情况退化成纯文本（文字仍然完整，只是丢了链接）。
  */
 function render(el, text, parts = []) {
+  // 先把模型写歪的标记归一，再吃掉紧挨着标记的那一个换行
+  //（只吃一个：模型多打的空行留着，宁可多一行也不少一行）
+  text = text
+    .replace(HTML_BR, '<n0/>')
+    .replace(SLOPPY_BREAK, '<n$1/>')
+    .replace(SLOPPY_TAG, (_, close, kind, num, self) => `<${close}${kind}${num}${self}>`)
+    .replace(NL_BEFORE_BREAK, '$1')
+    .replace(NL_AFTER_BREAK, '$1');
   const frag = document.createDocumentFragment();
   const stack = [frag];
   const push = (node) => stack[stack.length - 1].append(node);
@@ -504,8 +559,17 @@ function render(el, text, parts = []) {
     emit(text.slice(last, m.index));
     last = m.index + m[0].length;
     const [, close, kind, num, selfClose] = m;
+    if (kind === 'n') {
+      emit('\n'); // 换行标记不对应任何元素
+      continue;
+    }
     const src = parts[+num - 1];
-    if (!src) continue; // 编号是模型编出来的，没有对应元素就丢掉标记
+    // 编号是模型编出来的，没有对应元素就丢掉标记；段落标记还得补回一个换行，
+    // 它周围的换行在上面已经去掉了，直接丢会把两段并成一段
+    if (!src) {
+      if (kind === 'b') emit('\n');
+      continue;
+    }
     if (kind === 'x' || selfClose) {
       push(sanitize(src.cloneNode(true)));
       continue;
@@ -518,8 +582,9 @@ function render(el, text, parts = []) {
     push(wrap);
     stack.push(wrap);
   }
-  // 尾部可能是半个标记（`<t1` 还没传完），别把它当正文显示出来
-  emit(text.slice(last).replace(/<\/?[tx]?\d*\/?$/, ''));
+  // 尾部可能是半个标记（`<t1`、`<br` 还没传完），别把它当正文显示出来。
+  // 只吃掉「< + 字母数字」这种形状，正文里的 `5 < 6` 不受影响
+  emit(text.slice(last).replace(/<\/?[a-z]*\d*\/?$/i, ''));
   el.replaceChildren(frag);
 }
 

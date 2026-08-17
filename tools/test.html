@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" />
+  <title>测试</title>
+  <!--
+    ================= 结构编解码测试（在浏览器里打开本文件）=================
+
+    encodeInline 的判断全部来自排版引擎——元素是不是块级要看 computed display，
+    换行是不是内容要看 white-space，flex 子项的 display 还会被强制成 block。
+    node 里的 DOM 桩模拟不出这些，所以这部分必须在真实浏览器里跑。
+    纯逻辑的部分在 tools/test.js：node --test tools/test.js
+
+    每个用例都验证同一条不变量：
+      原文 --encodeInline--> 送给模型的文本 --（模拟模型原样吐回，含各种写歪的姿势）--> render
+      还原出来的排版必须和原文一模一样。
+  -->
+  <style>
+    body { background: #15181c; color: #e7e9ea; font: 14px/1.6 -apple-system, BlinkMacSystemFont, sans-serif; margin: 24px; }
+    #summary { position: sticky; top: 0; padding: 10px 14px; border-radius: 8px; font-size: 16px; font-weight: 600; }
+    #summary.pass { background: #0d3a22; color: #7ee787; }
+    #summary.fail { background: #3d1418; color: #ff8a80; }
+    .case { border: 1px solid #2f3336; border-radius: 8px; padding: 10px 14px; margin: 14px 0; }
+    .case > h2 { font-size: 14px; margin: 0 0 8px; color: #8b98a5; font-weight: 600; }
+    .ok { color: #7ee787; }
+    .bad { color: #ff8a80; font-weight: 600; }
+    pre { background: #0d1117; padding: 8px 10px; border-radius: 6px; white-space: pre-wrap;
+          word-break: break-all; color: #79c0ff; font-size: 12px; margin: 6px 0; }
+    .stage { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .stage > div { border: 1px dashed #2f3336; border-radius: 6px; padding: 6px 10px; min-width: 0; }
+    .stage h3 { font-size: 12px; color: #8b98a5; margin: 0 0 4px; font-weight: 500; }
+
+    /* ---- 各站点的关键样式，照抄真实页面 ---- */
+    .tweet { white-space: pre-wrap; }        /* X：整条推文一个元素，段落靠文本里的 \n */
+    .mention-shell { display: inline-flex; } /* X：@某人 的外壳，子项会被 blockify 成 block */
+    .mention-row { display: flex; flex-direction: row; }
+    .italic { font-style: italic; }
+    .gone { display: none; }
+    .invisible { visibility: hidden; }
+  </style>
+
+  <div id="summary">跑起来了…</div>
+  <div id="cases"></div>
+
+  <!-- content.js 一加载就读配置、注册监听，给最小的桩，别的一概不动 -->
+  <script>
+    window.chrome = {
+      storage: { local: { get: async () => ({}) }, onChanged: { addListener() {} } },
+      runtime: {
+        connect: () => ({ onMessage: { addListener() {} }, onDisconnect: { addListener() {} }, postMessage() {} }),
+        sendMessage: async () => ({}),
+        onMessage: { addListener() {} },
+      },
+    };
+  </script>
+  <script src="../config.js"></script>
+  <script src="../content.js"></script>
+
+  <script>
+    /* ---------- 用例 ---------- */
+
+    const CASES = [
+      {
+        name: 'X 推文：pre-wrap 文本节点里的 \\n 就是分段，@某人 是 flex 壳不能算段落',
+        html: `<div class="tweet"><span><span>第一段的文字，末尾跟着 </span></span><span class="mention-shell"><span class="mention-row"><a href="/someone">@某人</a></span></span><span><span>。
+
+第二段的文字，中间有 <span class="italic">强调</span> 的词。
+
+第三段的文字。</span></span></div>`,
+        // 分段必须落在标记上，@某人 那一串壳子必须全是行内标记
+        expectSource:
+          '<t1><t2>第一段的文字，末尾跟着 </t2></t1><t3><t4><t5>@某人</t5></t4></t3>' +
+          '<t6><t7>。<n1/>\n<n2/>\n第二段的文字，中间有 <t8>强调</t8> 的词。<n3/>\n<n4/>\n第三段的文字。</t7></t6>',
+      },
+      {
+        name: '评论区：<br><br> 分段',
+        html: `<div>第一段的文字。<br><br>第二段的文字。<br><br>第三段的文字。</div>`,
+        expectSource: '第一段的文字。<n1/>\n<n2/>\n第二段的文字。<n3/>\n<n4/>\n第三段的文字。',
+      },
+      {
+        name: '文章：<p> 段落与 <ul><li> 列表，译文要套回原元素',
+        html: `<div><p class="lead">第一段的文字。</p><p>第二段的文字。</p><ul><li>列表一</li><li>列表二</li></ul></div>`,
+        expectSource:
+          '<b1>第一段的文字。</b1>\n\n<b2>第二段的文字。</b2>\n\n<b3>\n<b4>列表一</b4>\n\n<b5>列表二</b5>\n</b3>',
+      },
+      {
+        name: '行内结构：链接、加粗保留，代码和图片整体保护',
+        html: `<p>点击 <a href="/s" class="lnk">设置</a> 并运行 <code>npm i</code>，见 <strong>下图</strong> <img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt=""></p>`,
+        expectSource: '点击 <t1>设置</t1> 并运行 <x2/>，见 <t3>下图</t3> <x4/>',
+      },
+      {
+        name: '表格：单元格各自成段，结构不能塌',
+        html: `<table><tbody><tr><td>甲一</td><td>甲二</td></tr><tr><td>乙一</td><td>乙二</td></tr></tbody></table>`,
+        skipRoundTrip: true, // 译文节点是 div，装不下 tr/td，只验证编码
+        expectSource:
+          '<b1>\n<b2>\n<b3>甲一</b3>\n\n<b4>甲二</b4>\n</b2>\n\n<b5>\n<b6>乙一</b6>\n\n<b7>乙二</b7>\n</b5>\n</b1>',
+      },
+      {
+        name: '看不见的元素不进原文',
+        html: `<div>看得见的文字<span class="gone">display-none 的文字</span><span class="invisible">visibility-hidden 的文字</span></div>`,
+        expectSource: '看得见的文字',
+        skipRoundTrip: true,
+      },
+      {
+        name: '已经插进去的译文不会被再翻一遍',
+        html: `<div><p>原文段落。</p><p data-ai-translation="1">上一次的译文。</p></div>`,
+        expectSource: '<b1>原文段落。</b1>',
+        skipRoundTrip: true,
+      },
+      {
+        name: '<pre> 代码块整体保护，一个字都不参与翻译',
+        html: `<div><p>看这段代码：</p><pre>if (a &lt; b) {\n  run();\n}</pre></div>`,
+        expectSource: '<b1>看这段代码：</b1>\n<x2/>',
+        skipRoundTrip: true,
+      },
+    ];
+
+    /* ---------- 模拟模型的输出：原样吐回，以及各种写歪的姿势 ---------- */
+
+    const BREAK = /<n(\d+)\/>/g;
+    const PARA = /<b(\d+)>/g;
+
+    // 这些写法必须还原出与原文完全一致的排版
+    const 保排版 = {
+      '原样吐回': (s) => s,
+      '换成真正的 <br/>': (s) => s.replace(BREAK, '<br/>'),
+      '换成 <br> 不带斜杠': (s) => s.replace(BREAK, '<br>'),
+      '多打一个右尖括号': (s) => s.replace(BREAK, '<n$1/>>').replace(PARA, '<b$1>>'),
+      '多打一个左尖括号': (s) => s.replace(BREAK, '<<n$1/>').replace(PARA, '<<b$1>'),
+      '标记里多了空格': (s) => s.replace(BREAK, '<n$1 />').replace(PARA, '<b$1 >'),
+      '写成闭合标记': (s) => s.replace(BREAK, '</n$1>'),
+      '漏了自闭合斜杠': (s) => s.replace(BREAK, '<n$1>'),
+      '排版换行全丢': (s) => s.replace(/\n/g, ''),
+      '排版换行变成空格': (s) => s.replace(/\n/g, ' '),
+    };
+
+    // 标记全丢是最坏情况：排版保不住，但一个字都不能少
+    const 保文字 = { '标记全部丢光': (s) => s.replace(/<\/?[txbn]\d+\/?>/g, '') };
+
+    /* ---------- 断言 ---------- */
+
+    const 归一 = (s) => s.replace(/ /g, ' ').replace(/[^\S\n]+/g, ' ').replace(/[ \t]*\n/g, '\n').trim();
+    const 只看字 = (s) => s.replace(/\s+/g, '');
+    // 不比 <br>：原文靠 pre-wrap 里的 \n 换行时译文用的是 <br>，渲染一样但节点不同，
+    // 排版是否一致交给上面的 innerText 断言把关
+    const 标签序列 = (root) =>
+      [...root.querySelectorAll('*')].map((e) => e.tagName).filter((t) => t !== 'BR').join(',');
+    // 模型没吐回来的标记，其内容（代码、图片）本来就不在译文里，只能要求「译文里的字一个不少」
+    const 去标记 = (s) => s.replace(/<\/?[txbn]\d+\/?>/g, '');
+
+    /** 照 createTarget 的做法建译文节点：同标签同属性，页面 CSS 才会同样命中 */
+    function makeTarget(block) {
+      const t = document.createElement(block.tagName);
+      for (const { name, value } of block.attributes) if (name !== 'id') t.setAttribute(name, value);
+      return t;
+    }
+
+    const results = [];
+    const casesEl = document.getElementById('cases');
+
+    for (const c of CASES) {
+      const box = document.createElement('div');
+      box.className = 'case';
+      box.innerHTML = `<h2>${c.name.replace(/</g, '&lt;')}</h2>`;
+      const host = document.createElement('div');
+      host.innerHTML = c.html;
+      const block = host.firstElementChild;
+      box.append(host);
+      casesEl.append(box);
+
+      const { text, parts } = encodeInline(block);
+      const log = (ok, label, detail) => {
+        results.push(ok);
+        const line = document.createElement('div');
+        line.className = ok ? 'ok' : 'bad';
+        line.textContent = `${ok ? '✓' : '✗'} ${label}`;
+        box.append(line);
+        if (!ok && detail) {
+          const pre = document.createElement('pre');
+          pre.textContent = detail;
+          box.append(pre);
+        }
+      };
+
+      const src = document.createElement('pre');
+      src.textContent = JSON.stringify(text);
+      box.append(src);
+
+      log(text === c.expectSource, '送给模型的原文与预期一致', `实际 ${JSON.stringify(text)}\n预期 ${JSON.stringify(c.expectSource)}`);
+
+      if (c.skipRoundTrip) continue;
+
+      const 原排版 = 归一(block.innerText);
+      const 原标签 = 标签序列(block);
+      const stage = document.createElement('div');
+      stage.className = 'stage';
+      box.append(stage);
+
+      for (const [名字, 弄歪] of Object.entries(保排版)) {
+        const target = makeTarget(block);
+        render(target, 弄歪(text), parts);
+        const cell = document.createElement('div');
+        cell.innerHTML = `<h3>${名字}</h3>`;
+        cell.append(target);
+        stage.append(cell);
+        log(归一(target.innerText) === 原排版, `${名字} → 排版与原文一致`, `实际\n${JSON.stringify(归一(target.innerText))}\n预期\n${JSON.stringify(原排版)}`);
+        log(标签序列(target) === 原标签, `${名字} → 元素结构与原文一致`, `实际 ${标签序列(target)}\n预期 ${原标签}`);
+      }
+
+      for (const [名字, 弄歪] of Object.entries(保文字)) {
+        const target = makeTarget(block);
+        render(target, 弄歪(text), parts);
+        log(只看字(target.innerText) === 只看字(去标记(text)), `${名字} → 文字一个不少`, target.innerText);
+      }
+    }
+
+    const failed = results.filter((r) => !r).length;
+    const summary = document.getElementById('summary');
+    summary.className = failed ? 'fail' : 'pass';
+    summary.textContent = failed ? `FAIL ${failed} / ${results.length}` : `PASS ${results.length} / ${results.length}`;
+    document.title = summary.textContent;
+  </script>
+</html>

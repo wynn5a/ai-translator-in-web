@@ -173,12 +173,16 @@ const RULES = [
   '术语按该领域内的通行译法，不自造、不音译。',
   '保持原文的语域和语气：正式的别译成口语，口语的别译成书面语，营销文案保留其调性。',
   '本来就是目标语言的片段原样输出。',
+  '保持分段：原文的换行和空行原样保留，原文有几段就译成几段，不要合并成一段，也不要另起新段。',
 ];
 
 const TAG_RULE =
-  '文中 <t1>…</t1> 是行内标记，<x1/> 是不可翻译的片段（代码、图片等）。' +
+  '文中 <b1>…</b1> 是段落标记，<n1/> 是换行，<t1>…</t1> 是行内标记，<x1/> 是不可翻译的片段（代码、图片等）。' +
   '所有标记原样保留，编号和数量都不能变（编号可能不连续，照原样用）；' +
-  '只翻译标记之间的文字，标记可随译文语序移动位置，但不要新增、删除或合并标记。';
+  '只翻译标记之间的文字，标记可随译文语序移动位置，但不要新增、删除或合并标记。' +
+  '分段以标记为准：<b1>…</b1> 各自是独立的一段，<n1/> 处必须换行，' +
+  '原文分几段译文就分几段，绝不能把几段合并成一段。' +
+  '标记连编号一起照抄，不要改写成别的写法：换行只能是 <n1/>，不许换成 <br>、<br/> 或任何 HTML 标签。';
 
 const TERM_RULES = [
   '按这句话里的实际用法选义项，不要罗列其他义项。',
@@ -194,6 +198,9 @@ const GLOSSARY_RULES = [
   '每行一条，格式为「原文=译文」，不要编号、不要解释、不要输出思考过程。',
   '没有值得记录的术语时，只输出一个「无」字。',
 ];
+
+// 提示词一改，旧译文就不该再拿出来用：这里 +1，缓存整体作废
+const PROMPT_VERSION = 3;
 
 const numbered = (list) => list.map((s, i) => `${i + 1}. ${s}`).join('\n');
 
@@ -265,7 +272,7 @@ function buildMessages(job, lang) {
 /* ---------- 长段落分片：整段直发会漏译、后半段质量下滑，还可能撞输出上限 ---------- */
 
 const CHUNK_LIMIT = 1400; // 源字符数；多数段落一次发完，不触发分片
-const TAG_RE = /<(\/?)([tx])(\d+)(\/?)>/g;
+const TAG_RE = /<(\/?)([txbn])(\d+)(\/?)>/g;
 
 const CJK_STOP = /[。！？；…]/; // 中文句末标点后面没有空格，不能要求空白
 const ASCII_STOP = /[.!?;]/;
@@ -285,8 +292,9 @@ function breakpoints(text) {
       TAG_RE.lastIndex = i;
       const m = TAG_RE.exec(text);
       if (m?.index === i) {
-        if (m[1]) depth--;
-        else if (!m[4] && m[2] === 't') depth++;
+        // 只有行内标记算深度：段落标记跨了分片也能还原，切在段落中间是允许的，
+        // 否则一个超长段落里一个断点都找不到，只能硬切
+        if (m[2] === 't') depth += m[1] ? -1 : m[4] ? 0 : 1;
         i += m[0].length - 1;
         continue;
       }
@@ -358,8 +366,17 @@ async function translate(job, onChunk = () => {}, signal) {
   const c = await getCache();
   // 端点也参与 key：两个 profile 用同名模型指向不同服务时，译文不能互相串
   // 页面标题参与 key：它进了提示词，换页面同一句话的译法可能不同
-  const key = [cfg.baseUrl, cfg.model, cfg.targetLang, job.kind, job.page?.site, job.page?.title, job.context, job.text]
-    .join('\x01');
+  const key = [
+    PROMPT_VERSION,
+    cfg.baseUrl,
+    cfg.model,
+    cfg.targetLang,
+    job.kind,
+    job.page?.site,
+    job.page?.title,
+    job.context,
+    job.text,
+  ].join('\x01');
   const hit = c.get(key);
   if (hit !== undefined) {
     c.delete(key), c.set(key, hit); // 命中即刷新为最近使用
