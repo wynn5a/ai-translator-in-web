@@ -200,7 +200,7 @@ const GLOSSARY_RULES = [
 ];
 
 // 提示词一改，旧译文就不该再拿出来用：这里 +1，缓存整体作废
-const PROMPT_VERSION = 3;
+const PROMPT_VERSION = 4;
 
 const numbered = (list) => list.map((s, i) => `${i + 1}. ${s}`).join('\n');
 
@@ -216,7 +216,12 @@ const termsLine = (terms) =>
 function pageLine(page) {
   if (!page?.site) return '';
   const where = page.title ? `${page.site} 的页面《${page.title}》` : page.site;
-  return `【来源】${where}${page.desc ? `\n【页面简介】${page.desc}` : ''}\n请按这个主题和领域选择术语。`;
+  // 这两项常常整段就是原文本身（X 的 document.title 就是推文），模型会顺手照抄，
+  // 连带把译文写成原文语言：明确它只是背景，不是待译内容
+  return (
+    `【来源】${where}${page.desc ? `\n【页面简介】${page.desc}` : ''}\n` +
+    '以上只用来判断主题和领域，它本身不是待译内容：不要翻译它，也不要照抄其中的文字或语言。'
+  );
 }
 
 const join = (...parts) => parts.filter(Boolean).join('\n\n');
@@ -245,7 +250,7 @@ function buildMessages(job, lang) {
           pageLine(page),
           termsLine(terms),
           `要求：\n${numbered(TERM_RULES)}`,
-          '只输出释义本身：不要翻译整句、不要解释、不要加引号、不要输出思考过程。'
+          `只输出${lang}释义本身：不要翻译整句、不要解释、不要加引号、不要输出思考过程。`
         ),
       },
       { role: 'user', content: `句子：${context}\n需要翻译的词或短语：${text}` },
@@ -262,11 +267,26 @@ function buildMessages(job, lang) {
         `要求：\n${numbered(tagged ? [...RULES, TAG_RULE] : RULES)}`,
         part ? `这是一段长文的第 ${part[0]}/${part[1]} 部分，只翻译发给你的这部分。` : '',
         carry ? `前一部分译文的结尾是「…${carry}」，术语、人称和语气要接得上，不要重复已经翻译过的内容。` : '',
-        '只输出译文本身：不要复述原文、不要加引号、不要任何说明或思考过程。'
+        // 语言必须在末位再说一遍：【来源】【页面简介】可能整段都是原文语言
+        //（X 的 document.title 就是推文原文），开头那句「翻译成 X」会被它压过去
+        `只输出${lang}译文本身：不要复述原文、不要加引号、不要任何说明或思考过程。`
       ),
     },
     { role: 'user', content: text },
   ];
+}
+
+/** 有的模型分不清 system 和正文，会把提示词整段照抄出来当译文。
+    拿真正发出去的提示词行当指纹，命中就从那里截断：宁可少一段，也不能把提示词显示给用户。
+    短行（「要求：」）不参与，正文里可能真的出现。 */
+function stripEcho(out, prompt) {
+  let at = out.length;
+  for (const line of prompt.split('\n')) {
+    if (line.length < 12) continue;
+    const i = out.indexOf(line);
+    if (i >= 0 && i < at) at = i;
+  }
+  return out.slice(0, at).trim();
 }
 
 /* ---------- 长段落分片：整段直发会漏译、后半段质量下滑，还可能撞输出上限 ---------- */
@@ -463,11 +483,9 @@ function tokenLimit(model, len) {
 
 async function request(cfg, job, onChunk, signal) {
   const url = `${cfg.baseUrl.replace(/\/+$/, '')}/chat/completions`;
-  const body = {
-    model: cfg.model,
-    stream: true,
-    messages: buildMessages(job, cfg.targetLang),
-  };
+  const messages = buildMessages(job, cfg.targetLang);
+  const body = { model: cfg.model, stream: true, messages };
+  const clean = (s) => stripEcho(s, messages[0].content);
   // 三档参数：全量 → 只留调参 → 一个不带。
   // 400 往下降一档并记住，因为 o 系拒绝 temperature、部分中转站拒绝一切未知字段。
   const tuning = { temperature: TEMPERATURE[job.kind] ?? 0.2, ...tokenLimit(cfg.model, job.text.length) };
@@ -509,10 +527,12 @@ async function request(cfg, job, onChunk, signal) {
     }
     if (!res.ok) throw fail(await errorMessage(res), `http-${res.status}`);
 
-    const out = res.headers.get('content-type')?.includes('event-stream')
-      ? await readStream(res, onChunk, alive)
-      : await readJson(res, onChunk);
-    if (!out) throw fail('模型没有返回内容，换个模型或稍后再试');
+    const emit = (s) => onChunk(clean(s)); // 流式时也过一遍，提示词别在气泡里闪出来
+    const raw = res.headers.get('content-type')?.includes('event-stream')
+      ? await readStream(res, emit, alive)
+      : await readJson(res, emit);
+    const out = clean(raw);
+    if (!out) throw fail(raw ? '模型没有翻译，只把提示词复述了一遍，换个模型试试' : '模型没有返回内容，换个模型或稍后再试');
     return out;
   } catch (e) {
     if (signal?.aborted) throw e; // 用户主动取消，外层会忽略

@@ -171,6 +171,14 @@ test('四种任务的提示词各不相同', () => {
   assert.ok(all[3].includes('术语抽取器'));
 });
 
+test('模型把提示词照抄出来时不当译文显示', () => {
+  const { stripEcho } = background;
+  const sys = systemOf({ kind: 'block', text: 'x', page: { site: 'unfair.so', title: 'Pay less' } });
+  assert.equal(stripEcho(`Paste your site.\n\n${sys}`, sys), 'Paste your site.', '提示词之后的全砍掉');
+  assert.equal(stripEcho(sys, sys), '', '整段都是提示词就什么都不剩，外层会报错');
+  assert.equal(stripEcho('正常译文。要求：明天交。', sys), '正常译文。要求：明天交。', '短行不能误伤正文');
+});
+
 test('提示词版本号参与缓存键，改了提示词旧译文要作废', () => {
   assert.ok(Number.isInteger(background.read('PROMPT_VERSION')));
   assert.ok(/PROMPT_VERSION,/.test(require('node:fs').readFileSync(`${__dirname}/../background.js`, 'utf8')));
