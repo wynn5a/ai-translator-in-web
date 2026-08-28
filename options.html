@@ -39,7 +39,8 @@
   .row button { flex: none; width: 30px; padding: 0; line-height: 1; }
   .row button[disabled] { opacity: .4; cursor: default; }
   #delProfile.arm { border-color: var(--bad); color: var(--bad); width: auto; padding: 0 8px; font-size: 11px; }
-  #loadModels.busy { animation: spin 1s linear infinite; }
+  /* 只转图标，转整个按钮连边框一起歪 */
+  #loadModels.busy span { display: inline-block; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
   .divider { margin: 16px 0 12px; border-top: 1px solid var(--line); }
@@ -96,7 +97,7 @@
   <label for="model">模型</label>
   <div class="row">
     <select id="model"></select>
-    <button type="button" id="loadModels" title="重新获取模型列表">↻</button>
+    <button type="button" id="loadModels" title="重新获取模型列表"><span>↻</span></button>
   </div>
   <input type="text" id="modelCustom" placeholder="gpt-4o-mini" spellcheck="false" hidden />
   <p class="hint" id="modelHint"></p>
