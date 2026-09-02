@@ -351,10 +351,16 @@ function requestTranslation(payload, onPartial) {
       return resolve({ error: '扩展已更新或被禁用，请刷新页面后重试', code: 'reload' });
     }
     let partial = '';
+    // 模型每吐几个字就来一条消息，逐条重建 DOM 和排版跟不上；一帧只画最新的那份
+    let frame = 0;
+    const paint = () => ((frame = 0), onPartial(partial));
+    const finish = (result) => (cancelAnimationFrame(frame), resolve(result)); // 终稿马上画，不等那一帧
     port.onMessage.addListener((m) => {
-      if (m.chunk !== undefined) onPartial((partial = m.chunk));
-      else if (m.error) resolve({ error: m.error, code: m.code });
-      else if (m.done) resolve({ text: m.text });
+      if (m.chunk !== undefined) {
+        partial = m.chunk;
+        frame ||= requestAnimationFrame(paint);
+      } else if (m.error) finish({ error: m.error, code: m.code });
+      else if (m.done) finish({ text: m.text });
     });
     port.onDisconnect.addListener(() => resolve(partial ? { text: partial } : { error: '连接中断，请重试' }));
     port.postMessage(payload);

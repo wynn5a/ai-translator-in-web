@@ -179,6 +179,35 @@ test('模型把提示词照抄出来时不当译文显示', () => {
   assert.equal(stripEcho('正常译文。要求：明天交。', sys), '正常译文。要求：明天交。', '短行不能误伤正文');
 });
 
+test('思考模型混进正文的 <think> 块被去掉，流式半截也不露出来', () => {
+  const stripThink = background.read('stripThink');
+  assert.equal(stripThink('<think>先想想。</think>\n译文。'), '\n译文。');
+  assert.equal(stripThink('<think>还在想'), '', '结束标记没到之前整段藏着');
+  assert.equal(stripThink('</think>译文。'), '译文。', '有的模型只吐结束标记');
+  assert.equal(stripThink('正常译文。'), '正常译文。');
+});
+
+test('标记完整性检查：漏掉的标记被点名，写歪的不算漏', () => {
+  const missingTags = (s, o) => [...background.missingTags(s, o)]; // vm 里的数组不是本境的 Array，deepEqual 会挑剔
+  const src = '点 <t1>这里</t1> 运行 <x2/><n1/>\n<b3>第二段</b3>';
+  assert.deepEqual(missingTags(src, '点 <t1>这里</t1> 运行 <x2/><n1/>\n<b3>第二段</b3>'), []);
+  assert.deepEqual(missingTags(src, '点 <t1>这里</t1> 运行 <x2/><br>\n<b3 >第二段</b3>'), [], '<br> 和空格都归一');
+  assert.deepEqual(missingTags(src, '点这里 运行 <x2/><n1/>\n<b3>第二段</b3>'), ['<t1>', '</t1>']);
+  assert.deepEqual(missingTags(src, '点 <t1>这里</t1> 运行 <n1/>\n<b3>第二段</b3>'), ['<x2>']);
+  assert.deepEqual(missingTags(src, '点 <t1>这里</t1> 运行 <x2/>\n<b3>第二段</b3>'), ['<n/>']);
+  assert.deepEqual(missingTags('A。<n1/>\n<n2/>\nB。', 'A。<n7/><n8/>B。'), [], '换行标记只数个数');
+  assert.deepEqual(missingTags('用 <t1>List</t1>', '用 List<T1>'), ['<t1>', '</t1>'], '大写泛型不是标记');
+});
+
+test('补标记的重发提示词点名缺失的标记，且温度为 0', () => {
+  const sys = systemOf({ kind: 'block', text: 'x', tagged: true, repair: ['<t1>', '</t1>'] });
+  assert.ok(sys.includes('<t1> </t1>'));
+  assert.ok(sys.includes('一个都不能少'));
+  assert.ok(!systemOf({ kind: 'block', text: 'x', tagged: true }).includes('上一次'));
+  assert.equal(background.read('temperatureOf')({ kind: 'block', repair: ['<t1>'] }), 0);
+  assert.equal(background.read('temperatureOf')({ kind: 'block' }), 0.3);
+});
+
 test('提示词版本号参与缓存键，改了提示词旧译文要作废', () => {
   assert.ok(Number.isInteger(background.read('PROMPT_VERSION')));
   assert.ok(/PROMPT_VERSION,/.test(require('node:fs').readFileSync(`${__dirname}/../background.js`, 'utf8')));

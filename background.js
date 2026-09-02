@@ -226,8 +226,14 @@ function pageLine(page) {
 
 const join = (...parts) => parts.filter(Boolean).join('\n\n');
 
+/** 上一次输出把标记弄丢或写错了：重发时把缺的那几个点名列出来 */
+const repairLine = (missing) =>
+  missing?.length
+    ? `注意：上一次的译文丢失或改动了这些标记：${missing.join(' ')}。这次每个标记都必须原样出现，一个都不能少。`
+    : '';
+
 function buildMessages(job, lang) {
-  const { kind, text, context, page, tagged, carry, part, terms } = job;
+  const { kind, text, context, page, tagged, carry, part, terms, repair } = job;
 
   if (kind === 'glossary')
     return [
@@ -265,6 +271,7 @@ function buildMessages(job, lang) {
         termsLine(terms),
         kind === 'text' ? '这是用户在网页上选中的片段，可能不是完整句子。照原样翻译，不要补全、不要扩写。' : '',
         `要求：\n${numbered(tagged ? [...RULES, TAG_RULE] : RULES)}`,
+        tagged ? repairLine(repair) : '',
         part ? `这是一段长文的第 ${part[0]}/${part[1]} 部分，只翻译发给你的这部分。` : '',
         carry ? `前一部分译文的结尾是「…${carry}」，术语、人称和语气要接得上，不要重复已经翻译过的内容。` : '',
         // 语言必须在末位再说一遍：【来源】【页面简介】可能整段都是原文语言
@@ -281,12 +288,45 @@ function buildMessages(job, lang) {
     短行（「要求：」）不参与，正文里可能真的出现。 */
 function stripEcho(out, prompt) {
   let at = out.length;
-  for (const line of prompt.split('\n')) {
-    if (line.length < 12) continue;
+  for (const line of Array.isArray(prompt) ? prompt : echoLines(prompt)) {
     const i = out.indexOf(line);
     if (i >= 0 && i < at) at = i;
   }
   return out.slice(0, at).trim();
+}
+
+/** 流式时每个分片都要过一遍 stripEcho，指纹行只算一次 */
+const echoLines = (prompt) => prompt.split('\n').filter((line) => line.length >= 12);
+
+/** 思考模型在「关闭思考」参数被端点拒绝时，会把推理过程写在 <think>…</think> 里混进正文；
+    流式传到一半时结束标记还没到，整段都先藏着 */
+const stripThink = (s) => s.replace(/<think>[\s\S]*?(<\/think>|$)/gi, '').replace(/^\s*<\/think>/i, '');
+
+/* ---------- 标记完整性：模型漏标记那一段就退化成纯文本，丢链接和分段，值得再要一次 ---------- */
+
+// 与 content.js 的 render 同一套宽容：<br> 算换行标记，标记里的空白、多余尖括号归一，
+// 换行标记大小写都认，其余只认小写（正文里的 List<T1> 不是标记）
+const SLOPPY_TAG_RE = /<+\s*(\/?)\s*([txbnN])(\d+)\s*(\/?)\s*>+/g;
+const HTML_BR_RE = /<\s*br\s*\/?\s*>/gi;
+
+/** 标记多重集：换行标记只数个数（render 不看它的编号），其余按「斜杠+类型+编号」计 */
+function tagCounts(text) {
+  const counts = new Map();
+  const add = (k) => counts.set(k, (counts.get(k) || 0) + 1);
+  for (const m of text.replace(HTML_BR_RE, '<n0/>').matchAll(SLOPPY_TAG_RE)) {
+    const [, close, kind, num] = m;
+    add(kind.toLowerCase() === 'n' ? '<n/>' : `<${close}${kind.toLowerCase()}${num}>`);
+  }
+  return counts;
+}
+
+/** 译文里缺了哪些原文标记（每缺一个算一条）；多出来的不算，render 会把它们丢掉 */
+function missingTags(source, out) {
+  const want = tagCounts(source);
+  const got = tagCounts(out);
+  const missing = [];
+  for (const [tag, n] of want) for (let i = (got.get(tag) || 0); i < n; i++) missing.push(tag);
+  return missing;
 }
 
 /* ---------- 长段落分片：整段直发会漏译、后半段质量下滑，还可能撞输出上限 ---------- */
@@ -366,11 +406,30 @@ async function translateChunks(cfg, job, chunks, onChunk, signal) {
       carry: done ? done.trimEnd().slice(-160) : '',
       part: chunks.length > 1 ? [i + 1, chunks.length] : null,
     };
-    const out = await request(cfg, sub, (p) => onChunk(done + p), signal);
+    const out = await translateOne(cfg, sub, (p) => onChunk(done + p), signal);
     done += out + (i < chunks.length - 1 ? sep || '\n' : '');
     onChunk(done);
   }
   return done.trimEnd();
+}
+
+/**
+ * 翻译一片；带标记的译文若丢了标记，点名重发一次（温度 0），两次里取丢得少的那份。
+ * 只在出错时多花一次请求，正常情况零开销。
+ */
+async function translateOne(cfg, sub, onChunk, signal) {
+  const out = await request(cfg, sub, onChunk, signal);
+  if (!sub.tagged || sub.repair) return out;
+  const missing = missingTags(sub.text, out);
+  if (!missing.length) return out;
+  let retry;
+  try {
+    retry = await request(cfg, { ...sub, repair: [...new Set(missing)] }, onChunk, signal);
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    return out; // 重发失败就用第一份：文字是完整的，只是丢了结构
+  }
+  return missingTags(sub.text, retry).length < missing.length ? retry : out;
 }
 
 /* ---------- 主流程 ---------- */
@@ -399,8 +458,7 @@ async function translate(job, onChunk = () => {}, signal) {
   ].join('\x01');
   const hit = c.get(key);
   if (hit !== undefined) {
-    c.delete(key), c.set(key, hit); // 命中即刷新为最近使用
-    saveCache();
+    c.delete(key), c.set(key, hit); // 命中即刷新为最近使用；只是换了顺序，不值得整张表重写一遍落盘
     onChunk(hit);
     job.fromCache = true; // 这段的术语上次已经抽过了，别再花一次请求（见 harvest）
     return hit;
@@ -474,6 +532,7 @@ async function extractTerms(cfg, scope, source, target, signal) {
 
 /* 查词和抽术语要唯一解，段落要通顺，所以温度分档 */
 const TEMPERATURE = { term: 0, text: 0.2, block: 0.3, glossary: 0 };
+const temperatureOf = (job) => (job.repair ? 0 : TEMPERATURE[job.kind] ?? 0.2); // 补标记要的是听话，不是通顺
 
 /** 防止长段落被端点的默认输出上限截断；o 系 / gpt-5 换了字段名 */
 function tokenLimit(model, len) {
@@ -485,10 +544,11 @@ async function request(cfg, job, onChunk, signal) {
   const url = `${cfg.baseUrl.replace(/\/+$/, '')}/chat/completions`;
   const messages = buildMessages(job, cfg.targetLang);
   const body = { model: cfg.model, stream: true, messages };
-  const clean = (s) => stripEcho(s, messages[0].content);
+  const fingerprint = echoLines(messages[0].content);
+  const clean = (s) => stripEcho(stripThink(s), fingerprint);
   // 三档参数：全量 → 只留调参 → 一个不带。
   // 400 往下降一档并记住，因为 o 系拒绝 temperature、部分中转站拒绝一切未知字段。
-  const tuning = { temperature: TEMPERATURE[job.kind] ?? 0.2, ...tokenLimit(cfg.model, job.text.length) };
+  const tuning = { temperature: temperatureOf(job), ...tokenLimit(cfg.model, job.text.length) };
   const extras = { ...(cfg.noThink ? noThinkParams(cfg.baseUrl, cfg.model) : null), ...parseJson(cfg.extraBody) };
   const variants = [{ ...tuning, ...extras }, tuning, {}].filter(
     (v, i, all) => i === 0 || JSON.stringify(v) !== JSON.stringify(all[i - 1])
