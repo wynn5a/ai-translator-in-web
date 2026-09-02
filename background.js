@@ -408,14 +408,16 @@ async function translateChunks(cfg, job, chunks, onChunk, signal) {
     };
     const out = await translateOne(cfg, sub, (p) => onChunk(done + p), signal);
     done += out + (i < chunks.length - 1 ? sep || '\n' : '');
+    if (i === chunks.length - 1) done = done.trimEnd(); // 最后一帧与终稿一字不差，前端不必再画一遍
     onChunk(done);
   }
-  return done.trimEnd();
+  return done;
 }
 
 /**
  * 翻译一片；带标记的译文若丢了标记，点名重发一次（温度 0），两次里取丢得少的那份。
  * 只在出错时多花一次请求，正常情况零开销。
+ * 补发不走流式回调：第一份已经显示给用户，补发若最终没被采用，屏幕上就会白白换两次。
  */
 async function translateOne(cfg, sub, onChunk, signal) {
   const out = await request(cfg, sub, onChunk, signal);
@@ -424,7 +426,7 @@ async function translateOne(cfg, sub, onChunk, signal) {
   if (!missing.length) return out;
   let retry;
   try {
-    retry = await request(cfg, { ...sub, repair: [...new Set(missing)] }, onChunk, signal);
+    retry = await request(cfg, { ...sub, repair: [...new Set(missing)] }, () => {}, signal);
   } catch (e) {
     if (signal?.aborted) throw e;
     return out; // 重发失败就用第一份：文字是完整的，只是丢了结构
