@@ -206,8 +206,10 @@ function openAt(a) {
 /** content 可以是字符串或 DOM 节点（加载动画）；inline 是跟在正文末尾的按钮 */
 function showTip(content, { error = false, hint = false, actions = [], inline = null } = {}) {
   ensureTip();
-  if (typeof content === 'string') tipBody.textContent = content.replace(/\s+$/, ''); // 末尾空行会把 inline 按钮挤到下一行
-  else tipBody.replaceChildren(content);
+  if (typeof content === 'string') {
+    const s = content.replace(/\s+$/, ''); // 末尾空行会把 inline 按钮挤到下一行
+    if (tipBody.textContent !== s) tipBody.textContent = s; // 终稿与最后一帧相同就不重建，避免闪一下
+  } else tipBody.replaceChildren(content);
   if (inline) tipBody.append(inline);
   tipEl.classList.toggle('err', error);
   tipEl.classList.toggle('hint', hint);
@@ -540,7 +542,11 @@ function sanitize(node) {
  * 流式过程中标记可能还没闭合，一律宽容处理：认不出的标记就当它不存在，
  * 最坏情况退化成纯文本（文字仍然完整，只是丢了链接）。
  */
+const rendered = new WeakMap(); // 译文节点 → 上次渲染的原始文本，终稿与最后一帧相同就不再重建
+
 function render(el, text, parts = []) {
+  if (rendered.get(el) === text) return;
+  rendered.set(el, text);
   // 先把模型写歪的标记归一，再吃掉紧挨着标记的那一个换行
   //（只吃一个：模型多打的空行留着，宁可多一行也不少一行）
   text = text
