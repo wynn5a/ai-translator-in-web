@@ -348,6 +348,127 @@ test('流式完成或中止时取消尚未发送的旧帧', () => {
   assert.deepEqual(emitted, []);
 });
 
+/* ---------- 响应完整性 ---------- */
+
+function jsonResponse(text, finishReason) {
+  return {
+    ok: true,
+    status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => ({
+      choices: [{ message: { content: text }, finish_reason: finishReason }],
+    }),
+  };
+}
+
+function streamResponse(events) {
+  const value = new Uint8Array(
+    Buffer.from(`${events.map((event) => `data: ${JSON.stringify(event)}\n`).join('')}data: [DONE]\n`)
+  );
+  let sent = false;
+  return {
+    body: {
+      getReader: () => ({
+        read: async () => {
+          if (sent) return { done: true };
+          sent = true;
+          return { done: false, value };
+        },
+      }),
+    },
+  };
+}
+
+test('流式与非流式响应都保留 finish_reason', async () => {
+  const streamed = await background.readStream(
+    streamResponse([
+      { choices: [{ delta: { content: '未完成' } }] },
+      { choices: [{ delta: {}, finish_reason: 'length' }] },
+    ]),
+    () => {},
+    () => {}
+  );
+  assert.equal(streamed.text, '未完成');
+  assert.equal(streamed.finishReason, 'length');
+
+  const json = await background.readJson(jsonResponse('完成', 'stop'));
+  assert.equal(json.text, '完成');
+  assert.equal(json.finishReason, 'stop');
+});
+
+test('输出截断时自动提高 token 上限后重试', async () => {
+  const isolated = loadBackground();
+  const bodies = [];
+  const responses = [jsonResponse('未完成', 'length'), jsonResponse('完整译文', 'stop')];
+  isolated.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return responses.shift();
+  };
+  const cfg = { ...cacheCfg, model: 'gpt-4o-mini', noThink: false };
+  const out = await isolated.request(cfg, { kind: 'text', text: 'short source' }, () => {});
+
+  assert.equal(out, '完整译文');
+  assert.deepEqual(
+    bodies.map((body) => body.max_tokens),
+    [512, 4096]
+  );
+});
+
+test('无法再提高 token 上限时明确报告截断', async () => {
+  const isolated = loadBackground();
+  let requests = 0;
+  isolated.fetch = async () => {
+    requests++;
+    return jsonResponse('仍未完成', 'length');
+  };
+  const cfg = { ...cacheCfg, model: 'gpt-4o-mini', noThink: false };
+  const job = { kind: 'block', text: 'x'.repeat(1400), tagged: false };
+
+  await assert.rejects(
+    () => isolated.request(cfg, job, () => {}),
+    (error) => error.code === 'truncated' && error.message.includes('长度上限')
+  );
+  assert.equal(requests, 1);
+});
+
+test('截断且无法恢复的译文不会进入缓存', async () => {
+  const isolated = loadBackground();
+  isolated.testCfg = { ...cacheCfg, model: 'gpt-4o-mini', noThink: false };
+  isolated.read(`
+    cache = new Map();
+    loadConfig = async () => ({ active: testCfg });
+  `);
+  isolated.fetch = async () => jsonResponse('未完成', 'length');
+
+  await assert.rejects(
+    () => isolated.translateWithContext({ kind: 'text', text: 'short source' }),
+    (error) => error.code === 'truncated'
+  );
+  assert.equal((await isolated.getCache()).size, 0);
+});
+
+test('最大 token 仍截断时自动把源文分成更小的安全分片', async () => {
+  const isolated = loadBackground();
+  isolated.requestLengths = [];
+  isolated.read(`
+    request = async (_cfg, job) => {
+      requestLengths.push(job.text.length);
+      if (job.text.length > 500) throw Object.assign(new Error('truncated'), { code: 'truncated' });
+      return job.text;
+    }
+  `);
+  const source = 'a'.repeat(1000);
+  const out = await isolated.translateChunks(
+    {},
+    { kind: 'block', text: source, tagged: false, scope: '' },
+    [{ text: source, sep: '' }],
+    () => {}
+  );
+
+  assert.equal(out.replace(/\n/g, ''), source);
+  assert.deepEqual([...isolated.requestLengths], [1000, 500, 500]);
+});
+
 /* ---------- 冷启动存储 ---------- */
 
 function deferred() {
@@ -442,5 +563,6 @@ test('补标记请求开始前先显示完整首稿', async () => {
 
 test('提示词版本号参与缓存键，改了提示词旧译文要作废', () => {
   assert.ok(Number.isInteger(background.read('PROMPT_VERSION')));
+  assert.ok(Number.isInteger(background.read('CACHE_VERSION')));
   assert.ok(/PROMPT_VERSION,/.test(require('node:fs').readFileSync(`${__dirname}/../background.js`, 'utf8')));
 });
