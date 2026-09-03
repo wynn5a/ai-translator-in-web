@@ -135,6 +135,7 @@ node --test tools/test.js
 | --- | --- |
 | `manifest.json` | MV3 清单 |
 | `config.js` | 配置模型：profile 结构、读取、旧版配置迁移；三个上下文共用 |
+| `markers.js` | 结构占位标记的共享语法：归一、遍历、计数与移除 |
 | `background.js` | Service Worker：读配置、提示词、术语表、长段落分片、调用模型、缓存、超时与错误处理、右键菜单、发音的 offscreen 文档管理 |
 | `content.js` | 触发键监听、页面背景采集、行内结构编解码、气泡渲染与定位、段落译文插入 |
 | `offscreen.html/js` | 发音的播放端：取音频并播放，不受宿主页面 CSP 影响，空闲即自关 |

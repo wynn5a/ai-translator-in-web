@@ -426,20 +426,10 @@ function existingTranslation(block) {
 const ATOMIC = /^(CODE|KBD|SAMP|VAR|TT|PRE|IMG|SVG|MATH|PICTURE|BUTTON|SELECT)$/;
 // 既不译也不克隆：重复渲染只会让 iframe/视频再加载一遍，表单控件也没有可译文字
 const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|IFRAME|VIDEO|AUDIO|OBJECT|EMBED|CANVAS|INPUT|TEXTAREA)$/;
-const TAG_RE = /<(\/?)([txbn])(\d+)(\/?)>/g;
 // 这些 white-space 下换行是内容而不是排版空白：X 的推文整条就是一个元素，段落全靠它撑开
 const PRE_NL = /^(pre|pre-wrap|pre-line|break-spaces)/;
 // 弹性/网格容器的子项 computed display 会被强制成 block，但它并不换行，不能当块级处理
 const FLEX = /flex|grid/;
-// 模型常「好心」把 <n1/> 换成真正的 <br>，当它是换行标记，别把标签当正文显示出来
-const HTML_BR = /<\s*br\s*\/?\s*>/gi;
-// 标记也会被打歪：<n4 />、</n4>、多一个尖括号的 <n4/>>。先归一成规范写法，
-// 否则严格的 TAG_RE 只认走其中一段，剩下的尖括号就当正文显示出来了。
-// 尖括号和斜杠附近容许空白，字母和数字之间不容许：正文里的 `a < b 3 >` 不会被误伤。
-// 换行标记大小写都认——模型只在这一类上出错，而正文里几乎不可能出现 <N1/>；
-// 其余标记只认小写，否则正文里的 List<T1> 会被当成标记吞掉
-const SLOPPY_BREAK = /<+\s*\/?\s*[nN](\d+)\s*\/?\s*>+/g;
-const SLOPPY_TAG = /<+\s*(\/?)\s*([txb])(\d+)\s*(\/?)\s*>+/g;
 // 分段标记周围的换行只是发给模型时的排版，还原时要去掉，否则空行翻倍
 const BREAK_TAG = '(?:<\\/?b\\d+>|<\\/?n\\d+\\/?>)'; // 换行标记的斜杠模型爱丢，丢了也当它是
 // 换行最多吃一个（模型自己多打的空行留着，宁可多一行也不少一行），
@@ -524,7 +514,7 @@ function encodeInline(block) {
   return { text, parts, tagged: parts.length > 0 };
 }
 
-const visibleLength = (text) => text.replace(TAG_RE, '').length;
+const visibleLength = (text) => stripMarkers(text).length;
 
 /** 克隆行内元素时去掉 id 和行内事件：id 不能重复，页面的 onclick 也不该跟着复制一份 */
 function sanitize(node) {
@@ -549,10 +539,7 @@ function render(el, text, parts = []) {
   rendered.set(el, text);
   // 先把模型写歪的标记归一，再吃掉紧挨着标记的那一个换行
   //（只吃一个：模型多打的空行留着，宁可多一行也不少一行）
-  text = text
-    .replace(HTML_BR, '<n0/>')
-    .replace(SLOPPY_BREAK, '<n$1/>')
-    .replace(SLOPPY_TAG, (_, close, kind, num, self) => `<${close}${kind}${num}${self}>`)
+  text = normalizeMarkers(text)
     .replace(NL_BEFORE_BREAK, '$1')
     .replace(NL_AFTER_BREAK, '$1');
   const frag = document.createDocumentFragment();
@@ -567,7 +554,7 @@ function render(el, text, parts = []) {
   };
 
   let last = 0;
-  for (const m of text.matchAll(TAG_RE)) {
+  for (const m of markerMatches(text)) {
     emit(text.slice(last, m.index));
     last = m.index + m[0].length;
     const [, close, kind, num, selfClose] = m;

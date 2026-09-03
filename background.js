@@ -1,4 +1,4 @@
-importScripts('config.js'); // PROFILE_FIELDS / loadConfig / ensureProfiles
+importScripts('config.js', 'markers.js'); // 配置模型 + 结构标记语法
 
 const MAX_CONCURRENT = 10;
 const CACHE_KEY = '__cache';
@@ -304,26 +304,10 @@ const stripThink = (s) => s.replace(/<think>[\s\S]*?(<\/think>|$)/gi, '').replac
 
 /* ---------- 标记完整性：模型漏标记那一段就退化成纯文本，丢链接和分段，值得再要一次 ---------- */
 
-// 与 content.js 的 render 同一套宽容：<br> 算换行标记，标记里的空白、多余尖括号归一，
-// 换行标记大小写都认，其余只认小写（正文里的 List<T1> 不是标记）
-const SLOPPY_TAG_RE = /<+\s*(\/?)\s*([txbnN])(\d+)\s*(\/?)\s*>+/g;
-const HTML_BR_RE = /<\s*br\s*\/?\s*>/gi;
-
-/** 标记多重集：换行标记只数个数（render 不看它的编号），其余按「斜杠+类型+编号」计 */
-function tagCounts(text) {
-  const counts = new Map();
-  const add = (k) => counts.set(k, (counts.get(k) || 0) + 1);
-  for (const m of text.replace(HTML_BR_RE, '<n0/>').matchAll(SLOPPY_TAG_RE)) {
-    const [, close, kind, num] = m;
-    add(kind.toLowerCase() === 'n' ? '<n/>' : `<${close}${kind.toLowerCase()}${num}>`);
-  }
-  return counts;
-}
-
 /** 译文里缺了哪些原文标记（每缺一个算一条）；多出来的不算，render 会把它们丢掉 */
 function missingTags(source, out) {
-  const want = tagCounts(source);
-  const got = tagCounts(out);
+  const want = markerCounts(source);
+  const got = markerCounts(out);
   const missing = [];
   for (const [tag, n] of want) for (let i = (got.get(tag) || 0); i < n; i++) missing.push(tag);
   return missing;
@@ -332,7 +316,6 @@ function missingTags(source, out) {
 /* ---------- 长段落分片：整段直发会漏译、后半段质量下滑，还可能撞输出上限 ---------- */
 
 const CHUNK_LIMIT = 1400; // 源字符数；多数段落一次发完，不触发分片
-const TAG_RE = /<(\/?)([txbn])(\d+)(\/?)>/g;
 
 const CJK_STOP = /[。！？；…]/; // 中文句末标点后面没有空格，不能要求空白
 const ASCII_STOP = /[.!?;]/;
@@ -349,9 +332,8 @@ function breakpoints(text) {
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (ch === '<') {
-      TAG_RE.lastIndex = i;
-      const m = TAG_RE.exec(text);
-      if (m?.index === i) {
+      const m = markerAt(text, i);
+      if (m) {
         // 只有行内标记算深度：段落标记跨了分片也能还原，切在段落中间是允许的，
         // 否则一个超长段落里一个断点都找不到，只能硬切
         if (m[2] === 't') depth += m[1] ? -1 : m[4] ? 0 : 1;
@@ -487,7 +469,7 @@ async function translate(job, onChunk = () => {}, signal) {
 
 /* ---------- 往术语表里记：翻译完成之后才做，不占用户等待时间 ---------- */
 
-const visible = (text) => text.replace(TAG_RE, '').trim(); // 去掉行内占位标记
+const visible = (text) => stripMarkers(text).trim(); // 去掉结构占位标记
 
 /** 整块就是一个词组的译文（标题、表头、按钮、链接文字），可以直接当术语用 */
 const isPhrase = (s) => s.length <= TERM_MAX && !s.includes('\n') && s.split(/\s+/).length <= 6;

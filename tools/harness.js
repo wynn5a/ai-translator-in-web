@@ -128,7 +128,7 @@ function run(files, extra) {
 
 /** content.js：加载时会读配置、注册一堆监听，全部给桩 */
 const loadContent = () =>
-  run(['config.js', 'content.js'], {
+  run(['config.js', 'markers.js', 'content.js'], {
     document: makeDocument(),
     Text: Txt,
     location: { hostname: 'test.local' },
@@ -142,7 +142,8 @@ const loadContent = () =>
     getComputedStyle: () => ({ display: 'block', visibility: 'visible', whiteSpace: 'normal' }),
   });
 
-/** background.js：顶上的 importScripts 换成直接把 config.js 跑在同一个上下文里 */
-const loadBackground = () => run(['config.js', 'background.js'], { importScripts() {}, fetch: async () => {} });
+/** background.js：顶上的 importScripts 换成直接把依赖跑在同一个上下文里 */
+const loadBackground = () =>
+  run(['config.js', 'markers.js', 'background.js'], { importScripts() {}, fetch: async () => {} });
 
 module.exports = { loadContent, loadBackground, html, el, El, Txt };
