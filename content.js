@@ -42,6 +42,63 @@ const pageBrief = () => ({
   desc: tidy(metaContent('description'), 200),
 });
 
+const CONTEXT_LIMIT = 300;
+const CONTEXT_LEVELS = 3;
+const CONTEXT_EXCLUDE = 'pre,textarea,[contenteditable]:not([contenteditable="false"])';
+const HEADING_SELECTOR = 'h1,h2,h3,h4,h5,h6';
+
+function contextText(element, fromEnd = false) {
+  if (!element || element.dataset?.[MARK] || element.matches?.(CONTEXT_EXCLUDE)) return '';
+  const style = getComputedStyle(element);
+  if (style.display === 'none' || style.visibility === 'hidden') return '';
+  // LI / TD 的译文插在原元素内部；这时借 encodeInline 排除已经插入的译文
+  const raw = element.querySelector?.('[data-ai-translation]')
+    ? stripMarkers(encodeInline(element).text)
+    : element.innerText;
+  const text = raw?.replace(/\s+/g, ' ').trim() || '';
+  return fromEnd ? text.slice(-CONTEXT_LIMIT) : text.slice(0, CONTEXT_LIMIT);
+}
+
+/** 只看有限层级的相邻兄弟，避免把整页导航或侧栏当正文上下文。 */
+function adjacentContext(block, direction) {
+  const fromEnd = direction === 'previousElementSibling';
+  let node = block;
+  for (let level = 0; node && node !== document.body && level < CONTEXT_LEVELS; level++, node = node.parentElement) {
+    for (let candidate = node[direction]; candidate; candidate = candidate[direction]) {
+      const text = contextText(candidate, fromEnd);
+      if (text) return text;
+    }
+  }
+  return '';
+}
+
+function nearestHeading(block) {
+  let node = block;
+  for (let level = 0; node && node !== document.body && level < CONTEXT_LEVELS; level++, node = node.parentElement) {
+    for (let candidate = node.previousElementSibling; candidate; candidate = candidate.previousElementSibling) {
+      if (candidate.matches?.(HEADING_SELECTOR)) return contextText(candidate).slice(0, 120);
+      const headings = candidate.querySelectorAll?.(HEADING_SELECTOR);
+      for (let i = (headings?.length || 0) - 1; i >= 0; i--) {
+        const text = contextText(headings[i]).slice(0, 120);
+        if (text) return text;
+      }
+    }
+  }
+  return '';
+}
+
+/** 相邻内容只供消歧，不放进 user 消息，模型不能把它当成待译正文。 */
+function paragraphContext(block) {
+  const heading = nearestHeading(block);
+  const before = adjacentContext(block, 'previousElementSibling');
+  const context = {
+    heading,
+    before: before === heading ? '' : before,
+    after: adjacentContext(block, 'nextElementSibling'),
+  };
+  return Object.values(context).some(Boolean) ? context : null;
+}
+
 /* ---------- 语种判断：与目标语言一致才跳过 ---------- */
 
 const SCRIPTS = [
@@ -640,9 +697,10 @@ async function runBlock(block, force) {
     });
   }
 
+  const surrounding = paragraphContext(block); // 插入译文节点前读取，避免把加载动画当下文
   const target = createTarget(block);
   target.replaceChildren(dots());
-  const job = { kind: 'block', text: source, tagged, page: pageBrief() };
+  const job = { kind: 'block', text: source, tagged, page: pageBrief(), surrounding };
   const task = requestTranslation(job, (p) => {
     if (target.isConnected) render(target, p, parts);
     else task.cancel(); // 页面变化导致节点消失，停止请求

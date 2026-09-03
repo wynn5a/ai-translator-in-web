@@ -185,6 +185,22 @@ test('不带标记时不塞标记规则，但仍要求保持分段', () => {
   assert.ok(sys.includes('保持分段'));
 });
 
+test('段落相邻内容只作为 system 上下文，不混入待译正文', () => {
+  const job = {
+    kind: 'block',
+    text: 'Target paragraph.',
+    surrounding: {
+      heading: 'Architecture',
+      before: 'The service starts here.',
+      after: 'The client connects next.',
+    },
+  };
+  const messages = background.buildMessages(job, '简体中文');
+  for (const text of ['Architecture', 'The service starts here.', 'The client connects next.', '不要翻译、复述'])
+    assert.ok(messages[0].content.includes(text));
+  assert.equal(messages[1].content, job.text);
+});
+
 test('四种任务的提示词各不相同', () => {
   const kinds = ['block', 'text', 'term', 'glossary'];
   const all = kinds.map((kind) => systemOf({ kind, text: 'x', context: 'y' }));
@@ -259,6 +275,7 @@ test('缓存键覆盖所有影响提示词和请求行为的输入', () => {
     [{ ...cacheCfg, extraBody: '{"seed":1}' }, cacheJob],
     [cacheCfg, { ...cacheJob, tagged: true }],
     [cacheCfg, { ...cacheJob, page: { ...cacheJob.page, desc: 'Product landing page' } }],
+    [cacheCfg, { ...cacheJob, surrounding: { before: 'Previous paragraph' } }],
   ];
   for (const [cfg, job] of changed) assert.notEqual(background.cacheKeyFor(cfg, job), key);
 });
