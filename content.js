@@ -410,18 +410,26 @@ function requestTranslation(payload, onPartial) {
       return resolve({ error: '扩展已更新或被禁用，请刷新页面后重试', code: 'reload' });
     }
     let partial = '';
+    let settled = false;
     // 模型每吐几个字就来一条消息，逐条重建 DOM 和排版跟不上；一帧只画最新的那份
     let frame = 0;
     const paint = () => ((frame = 0), onPartial(partial));
-    const finish = (result) => (cancelAnimationFrame(frame), resolve(result)); // 终稿马上画，不等那一帧
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      cancelAnimationFrame(frame); // 终稿或错误马上处理，不让排队中的旧分片随后覆盖它
+      resolve(result);
+    };
     port.onMessage.addListener((m) => {
+      if (settled) return;
       if (m.chunk !== undefined) {
         partial = m.chunk;
         frame ||= requestAnimationFrame(paint);
       } else if (m.error) finish({ error: m.error, code: m.code });
       else if (m.done) finish({ text: m.text });
     });
-    port.onDisconnect.addListener(() => resolve(partial ? { text: partial } : { error: '连接中断，请重试' }));
+    // 未收到 done 的分片不是完整译文，不能因为端口中断就把它当成功结果。
+    port.onDisconnect.addListener(() => finish({ error: '连接中断，请重试', code: 'disconnect' }));
     port.postMessage(payload);
   });
   task.cancel = () => port?.disconnect(); // 断开即中止后台请求
