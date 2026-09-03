@@ -430,13 +430,15 @@ async function translateChunks(cfg, job, chunks, onChunk, signal) {
 /**
  * 翻译一片；带标记的译文若丢了标记，点名重发一次（温度 0），两次里取丢得少的那份。
  * 只在出错时多花一次请求，正常情况零开销。
- * 补发不走流式回调：第一份已经显示给用户，补发若最终没被采用，屏幕上就会白白换两次。
+ * 补发不走流式回调：先保持完整首稿，采用补发结果时再替换。
  */
 async function translateOne(cfg, sub, onChunk, signal) {
   const out = await request(cfg, sub, onChunk, signal);
   if (!sub.tagged || sub.repair) return out;
   const missing = missingTags(sub.text, out);
   if (!missing.length) return out;
+  // 流末尾若还在 25ms 合并窗口里会被 readStream 取消；补发可能等 30 秒，先确保完整首稿已经显示
+  onChunk(out);
   let retry;
   try {
     retry = await request(cfg, { ...sub, repair: [...new Set(missing)] }, () => {}, signal);

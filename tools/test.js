@@ -420,6 +420,26 @@ test('补标记的重发提示词点名缺失的标记，且温度为 0', () => 
   assert.equal(background.read('temperatureOf')({ kind: 'block' }), 0.3);
 });
 
+test('补标记请求开始前先显示完整首稿', async () => {
+  const isolated = loadBackground();
+  isolated.events = [];
+  isolated.read(`
+    request = async (_cfg, job) => {
+      events.push(job.repair ? 'repair-start' : 'initial-start');
+      return job.repair ? '<t1>译文</t1>' : '译文';
+    }
+  `);
+
+  const out = await isolated.translateOne(
+    {},
+    { text: '<t1>source</t1>', tagged: true },
+    (text) => isolated.events.push(`show:${text}`)
+  );
+
+  assert.deepEqual([...isolated.events], ['initial-start', 'show:译文', 'repair-start']);
+  assert.equal(out, '<t1>译文</t1>');
+});
+
 test('提示词版本号参与缓存键，改了提示词旧译文要作废', () => {
   assert.ok(Number.isInteger(background.read('PROMPT_VERSION')));
   assert.ok(/PROMPT_VERSION,/.test(require('node:fs').readFileSync(`${__dirname}/../background.js`, 'utf8')));
