@@ -136,6 +136,12 @@ const parseJson = (s) => {
   }
 };
 
+/** 真正进入完整请求档的额外参数；用户配置覆盖自动判断。 */
+const requestExtras = (cfg) => ({
+  ...(cfg.noThink ? noThinkParams(cfg.baseUrl, cfg.model) : null),
+  ...parseJson(cfg.extraBody),
+});
+
 /* ---------- 错误信息：先说人话，再附服务端原文 ---------- */
 
 const HTTP_HINT = {
@@ -433,6 +439,36 @@ async function translateOne(cfg, sub, onChunk, signal) {
 
 /* ---------- 主流程 ---------- */
 
+/** JSON 对象的键顺序不影响请求行为，也不该制造不同的缓存键。 */
+function canonicalJson(value) {
+  const canonical = (item) => {
+    if (Array.isArray(item)) return item.map(canonical);
+    if (!item || typeof item !== 'object') return item;
+    return Object.fromEntries(Object.keys(item).sort().map((key) => [key, canonical(item[key])]));
+  };
+  return JSON.stringify(canonical(value));
+}
+
+/** 只纳入会改变提示词或请求行为的配置；API Key 和 profile 名称绝不进入缓存。 */
+function cacheKeyFor(cfg, job) {
+  return canonicalJson([
+    PROMPT_VERSION,
+    cfg.baseUrl.replace(/\/+$/, ''),
+    cfg.model,
+    cfg.targetLang,
+    requestExtras(cfg),
+    job.kind,
+    !!job.tagged,
+    {
+      site: job.page?.site || '',
+      title: job.page?.title || '',
+      desc: job.page?.desc || '',
+    },
+    job.context || '',
+    job.text,
+  ]);
+}
+
 /** 一次翻译固定使用同一份配置，并把后处理需要的上下文随结果返回。 */
 async function translateWithContext(job, onChunk = () => {}, signal) {
   const { active: cfg } = await loadConfig(); // 当前 profile，切换后下一次翻译立即生效
@@ -440,19 +476,7 @@ async function translateWithContext(job, onChunk = () => {}, signal) {
 
   const c = await getCache();
   const scope = scopeOf(cfg, job.page);
-  // 端点也参与 key：两个 profile 用同名模型指向不同服务时，译文不能互相串
-  // 页面标题参与 key：它进了提示词，换页面同一句话的译法可能不同
-  const key = [
-    PROMPT_VERSION,
-    cfg.baseUrl,
-    cfg.model,
-    cfg.targetLang,
-    job.kind,
-    job.page?.site,
-    job.page?.title,
-    job.context,
-    job.text,
-  ].join('\x01');
+  const key = cacheKeyFor(cfg, job);
   const hit = c.get(key);
   if (hit !== undefined) {
     c.delete(key), c.set(key, hit); // 命中即刷新为最近使用；只是换了顺序，不值得整张表重写一遍落盘
@@ -548,7 +572,7 @@ async function request(cfg, job, onChunk, signal) {
   // 三档参数：全量 → 只留调参 → 一个不带。
   // 400 往下降一档并记住，因为 o 系拒绝 temperature、部分中转站拒绝一切未知字段。
   const tuning = { temperature: temperatureOf(job), ...tokenLimit(cfg.model, job.text.length) };
-  const extras = { ...(cfg.noThink ? noThinkParams(cfg.baseUrl, cfg.model) : null), ...parseJson(cfg.extraBody) };
+  const extras = requestExtras(cfg);
   const variants = [{ ...tuning, ...extras }, tuning, {}].filter(
     (v, i, all) => i === 0 || JSON.stringify(v) !== JSON.stringify(all[i - 1])
   );

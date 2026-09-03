@@ -235,6 +235,56 @@ test('术语收集沿用翻译开始时的配置上下文', async () => {
   background.read('clearTimeout(glossaryTimer)');
 });
 
+/* ---------- 缓存键 ---------- */
+
+const cacheCfg = {
+  baseUrl: 'https://api.example.com/v1',
+  apiKey: 'secret-a',
+  model: 'qwen-plus',
+  targetLang: '简体中文',
+  noThink: true,
+  extraBody: '',
+};
+const cacheJob = {
+  kind: 'block',
+  text: 'Translate this paragraph.',
+  tagged: false,
+  page: { site: 'example.com', title: 'Guide', desc: 'Technical documentation' },
+};
+
+test('缓存键覆盖所有影响提示词和请求行为的输入', () => {
+  const key = background.cacheKeyFor(cacheCfg, cacheJob);
+  const changed = [
+    [{ ...cacheCfg, noThink: false }, cacheJob],
+    [{ ...cacheCfg, extraBody: '{"seed":1}' }, cacheJob],
+    [cacheCfg, { ...cacheJob, tagged: true }],
+    [cacheCfg, { ...cacheJob, page: { ...cacheJob.page, desc: 'Product landing page' } }],
+  ];
+  for (const [cfg, job] of changed) assert.notEqual(background.cacheKeyFor(cfg, job), key);
+});
+
+test('缓存键忽略密钥、profile 名称和无意义的 JSON 顺序', () => {
+  const first = {
+    ...cacheCfg,
+    noThink: false,
+    extraBody: '{"reasoning":{"effort":"low","summary":"auto"},"seed":1}',
+    name: '日常',
+  };
+  const second = {
+    ...first,
+    apiKey: 'secret-b',
+    name: '备用',
+    baseUrl: `${first.baseUrl}/`,
+    extraBody: '{"seed":1,"reasoning":{"summary":"auto","effort":"low"}}',
+  };
+  const key = background.cacheKeyFor(first, cacheJob);
+  assert.equal(background.cacheKeyFor(second, cacheJob), key);
+  assert.ok(!key.includes(first.apiKey));
+  assert.ok(!key.includes(second.apiKey));
+  assert.ok(!key.includes(first.name));
+  assert.ok(!key.includes(second.name));
+});
+
 test('补标记的重发提示词点名缺失的标记，且温度为 0', () => {
   const sys = systemOf({ kind: 'block', text: 'x', tagged: true, repair: ['<t1>', '</t1>'] });
   assert.ok(sys.includes('<t1> </t1>'));
