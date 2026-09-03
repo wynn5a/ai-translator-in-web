@@ -216,7 +216,7 @@ const GLOSSARY_RULES = [
 ];
 
 // 提示词一改，旧译文就不该再拿出来用：这里 +1，缓存整体作废
-const PROMPT_VERSION = 4;
+const PROMPT_VERSION = 5;
 // 结果完整性规则改变时单独递增，避免继续命中旧版本可能截断的译文
 const CACHE_VERSION = 2;
 
@@ -242,6 +242,18 @@ function pageLine(page) {
   );
 }
 
+/** 目标段落附近的有限正文，只帮助消歧，不允许模型翻译或复述。 */
+function surroundingLine(surrounding) {
+  if (!surrounding) return '';
+  const lines = [
+    surrounding.heading ? `【最近标题】${surrounding.heading}` : '',
+    surrounding.before ? `【上文】${surrounding.before}` : '',
+    surrounding.after ? `【下文】${surrounding.after}` : '',
+  ].filter(Boolean);
+  if (!lines.length) return '';
+  return `${lines.join('\n')}\n以上是目标段落的相邻上下文，只用来消除歧义、衔接术语和指代；不要翻译、复述或输出其中的内容。`;
+}
+
 const join = (...parts) => parts.filter(Boolean).join('\n\n');
 
 /** 上一次输出把标记弄丢或写错了：重发时把缺的那几个点名列出来 */
@@ -251,7 +263,7 @@ const repairLine = (missing) =>
     : '';
 
 function buildMessages(job, lang) {
-  const { kind, text, context, page, tagged, carry, part, terms, repair } = job;
+  const { kind, text, context, page, surrounding, tagged, carry, part, terms, repair } = job;
 
   if (kind === 'glossary')
     return [
@@ -286,6 +298,7 @@ function buildMessages(job, lang) {
       content: join(
         `你是资深译者，把用户给出的${kind === 'block' ? '网页正文' : '文字'}翻译成${lang}。`,
         pageLine(page),
+        kind === 'block' ? surroundingLine(surrounding) : '',
         termsLine(terms),
         kind === 'text' ? '这是用户在网页上选中的片段，可能不是完整句子。照原样翻译，不要补全、不要扩写。' : '',
         `要求：\n${numbered(tagged ? [...RULES, TAG_RULE] : RULES)}`,
@@ -488,6 +501,7 @@ function cacheKeyFor(cfg, job) {
       title: job.page?.title || '',
       desc: job.page?.desc || '',
     },
+    job.surrounding || null,
     job.context || '',
     job.text,
   ]);

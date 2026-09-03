@@ -214,6 +214,29 @@
       }
     }
 
+    const contextBox = document.createElement('div');
+    contextBox.className = 'case';
+    contextBox.innerHTML =
+      '<h2>段落上下文：跳过已有译文，提取最近标题和前后原文</h2>' +
+      '<div><h2>Architecture</h2><p>Previous paragraph.</p>' +
+      '<p data-ai-translation="1">已有译文。</p><p id="context-target">Target paragraph.</p>' +
+      '<p>Next paragraph.</p></div>';
+    casesEl.append(contextBox);
+    const actualContext = paragraphContext(contextBox.querySelector('#context-target'));
+    const expectedContext = {
+      heading: 'Architecture',
+      before: 'Previous paragraph.',
+      after: 'Next paragraph.',
+    };
+    const contextOk = JSON.stringify(actualContext) === JSON.stringify(expectedContext);
+    results.push(contextOk);
+    const contextResult = document.createElement('div');
+    contextResult.className = contextOk ? 'ok' : 'bad';
+    contextResult.textContent = contextOk
+      ? '✓ 相邻上下文与预期一致'
+      : `✗ 实际 ${JSON.stringify(actualContext)}，预期 ${JSON.stringify(expectedContext)}`;
+    contextBox.append(contextResult);
+
     const failed = results.filter((r) => !r).length;
     const summary = document.getElementById('summary');
     summary.className = failed ? 'fail' : 'pass';
