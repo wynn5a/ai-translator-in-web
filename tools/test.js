@@ -285,6 +285,69 @@ test('缓存键忽略密钥、profile 名称和无意义的 JSON 顺序', () => 
   assert.ok(!key.includes(second.name));
 });
 
+/* ---------- 流式更新合并 ---------- */
+
+function fakeTimers() {
+  const pending = new Map();
+  let nextId = 1;
+  return {
+    schedule(fn) {
+      const id = nextId++;
+      pending.set(id, fn);
+      return id;
+    },
+    cancel(id) {
+      pending.delete(id);
+    },
+    run() {
+      const jobs = [...pending.values()];
+      pending.clear();
+      jobs.forEach((fn) => fn());
+    },
+    get size() {
+      return pending.size;
+    },
+  };
+}
+
+test('高频流式更新每个时间窗只发送最新文本', () => {
+  const timers = fakeTimers();
+  const emitted = [];
+  const updates = background.createLatestEmitter(
+    (text) => emitted.push(text),
+    (fn) => timers.schedule(fn),
+    (id) => timers.cancel(id)
+  );
+
+  updates.push('a');
+  updates.push('ab');
+  updates.push('abc');
+  assert.equal(timers.size, 1, '同一个时间窗只安排一个 timer');
+  assert.deepEqual(emitted, []);
+
+  timers.run();
+  assert.deepEqual(emitted, ['abc']);
+
+  updates.push('abcd');
+  timers.run();
+  assert.deepEqual(emitted, ['abc', 'abcd'], '下一个时间窗仍能继续发送');
+});
+
+test('流式完成或中止时取消尚未发送的旧帧', () => {
+  const timers = fakeTimers();
+  const emitted = [];
+  const updates = background.createLatestEmitter(
+    (text) => emitted.push(text),
+    (fn) => timers.schedule(fn),
+    (id) => timers.cancel(id)
+  );
+
+  updates.push('partial');
+  updates.cancel();
+  timers.run();
+  assert.deepEqual(emitted, []);
+});
+
 test('补标记的重发提示词点名缺失的标记，且温度为 0', () => {
   const sys = systemOf({ kind: 'block', text: 'x', tagged: true, repair: ['<t1>', '</t1>'] });
   assert.ok(sys.includes('<t1> </t1>'));

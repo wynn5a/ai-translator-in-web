@@ -4,6 +4,7 @@ const MAX_CONCURRENT = 10;
 const CACHE_KEY = '__cache';
 const CACHE_MAX = 300;
 const TIMEOUT = 30000; // 首字节 / 相邻分片之间的最长等待
+const STREAM_INTERVAL = 25; // 合并高频 token，避免每个 SSE 分片都跨扩展端口发送
 
 let inFlight = 0;
 const skipLevel = new Map(); // 端点+模型 → 参数降级到第几档，避免每次都从头试探
@@ -610,10 +611,9 @@ async function request(cfg, job, onChunk, signal) {
     }
     if (!res.ok) throw fail(await errorMessage(res), `http-${res.status}`);
 
-    const emit = (s) => onChunk(clean(s)); // 流式时也过一遍，提示词别在气泡里闪出来
     const raw = res.headers.get('content-type')?.includes('event-stream')
-      ? await readStream(res, emit, alive)
-      : await readJson(res, emit);
+      ? await readStream(res, (text) => onChunk(clean(text)), alive)
+      : await readJson(res);
     const out = clean(raw);
     if (!out) throw fail(raw ? '模型没有翻译，只把提示词复述了一遍，换个模型试试' : '模型没有返回内容，换个模型或稍后再试');
     return out;
@@ -629,34 +629,63 @@ async function request(cfg, job, onChunk, signal) {
   }
 }
 
+/**
+ * 一个时间窗只发送最后一份累计文本。cancel 用在完成、报错和中止路径，
+ * 最终结果由 translateChunks 同步发送，不让残留 timer 在结束后补发旧帧。
+ */
+function createLatestEmitter(emit, schedule = setTimeout, cancelTimer = clearTimeout) {
+  let timer = null;
+  let latest;
+
+  const push = (value) => {
+    latest = value;
+    if (timer !== null) return;
+    timer = schedule(() => {
+      timer = null;
+      emit(latest);
+    }, STREAM_INTERVAL);
+  };
+
+  const cancel = () => {
+    if (timer === null) return;
+    cancelTimer(timer);
+    timer = null;
+  };
+
+  return { push, cancel };
+}
+
 async function readStream(res, onChunk, alive) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
+  const updates = createLatestEmitter(onChunk);
   let buf = '';
   let out = '';
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    alive(); // 有数据就重置超时
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop();
-    for (const line of lines) {
-      if (!line.startsWith('data:')) continue;
-      const payload = line.slice(5).trim();
-      if (!payload || payload === '[DONE]') continue;
-      const delta = parseJson(payload)?.choices?.[0]?.delta;
-      if (delta?.content) onChunk((out += delta.content)); // reasoning_content 直接忽略
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      alive(); // 有数据就重置超时
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        const delta = parseJson(payload)?.choices?.[0]?.delta;
+        if (delta?.content) updates.push((out += delta.content)); // reasoning_content 直接忽略
+      }
     }
+    return out.trim();
+  } finally {
+    updates.cancel();
   }
-  return out.trim();
 }
 
 /** 端点不支持 stream 时的回退 */
-async function readJson(res, onChunk) {
-  const out = (await res.json().catch(() => null))?.choices?.[0]?.message?.content?.trim() || '';
-  if (out) onChunk(out);
-  return out;
+async function readJson(res) {
+  return (await res.json().catch(() => null))?.choices?.[0]?.message?.content?.trim() || '';
 }
 
 /* ---------- 单词发音：Google TTS 取音频，交给 offscreen 页播放 ----------
