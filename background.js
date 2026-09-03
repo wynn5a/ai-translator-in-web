@@ -217,6 +217,8 @@ const GLOSSARY_RULES = [
 
 // 提示词一改，旧译文就不该再拿出来用：这里 +1，缓存整体作废
 const PROMPT_VERSION = 4;
+// 结果完整性规则改变时单独递增，避免继续命中旧版本可能截断的译文
+const CACHE_VERSION = 2;
 
 const numbered = (list) => list.map((s, i) => `${i + 1}. ${s}`).join('\n');
 
@@ -332,6 +334,7 @@ function missingTags(source, out) {
 /* ---------- 长段落分片：整段直发会漏译、后半段质量下滑，还可能撞输出上限 ---------- */
 
 const CHUNK_LIMIT = 1400; // 源字符数；多数段落一次发完，不触发分片
+const MIN_RECOVERY_CHUNK = 240; // 达到最大输出仍截断时最多递归拆到这个量级
 
 const CJK_STOP = /[。！？；…]/; // 中文句末标点后面没有空格，不能要求空白
 const ASCII_STOP = /[.!?;]/;
@@ -416,10 +419,18 @@ async function translateChunks(cfg, job, chunks, onChunk, signal) {
       ...job,
       text,
       terms: await glossaryFor(job.scope, text), // 按分片各自命中的术语注入，不整段全发
-      carry: done ? done.trimEnd().slice(-160) : '',
+      carry: done ? done.trimEnd().slice(-160) : job.carry || '',
       part: chunks.length > 1 ? [i + 1, chunks.length] : null,
     };
-    const out = await translateOne(cfg, sub, (p) => onChunk(done + p), signal);
+    let out;
+    try {
+      out = await translateOne(cfg, sub, (p) => onChunk(done + p), signal);
+    } catch (error) {
+      if (error.code !== 'truncated' || text.length <= MIN_RECOVERY_CHUNK * 2) throw error;
+      const smaller = splitChunks(text, Math.ceil(text.length / 2));
+      if (smaller.length < 2) throw error;
+      out = await translateChunks(cfg, { ...job, carry: sub.carry }, smaller, (p) => onChunk(done + p), signal);
+    }
     done += out + (i < chunks.length - 1 ? sep || '\n' : '');
     if (i === chunks.length - 1) done = done.trimEnd(); // 最后一帧与终稿一字不差，前端不必再画一遍
     onChunk(done);
@@ -464,6 +475,7 @@ function canonicalJson(value) {
 /** 只纳入会改变提示词或请求行为的配置；API Key 和 profile 名称绝不进入缓存。 */
 function cacheKeyFor(cfg, job) {
   return canonicalJson([
+    CACHE_VERSION,
     PROMPT_VERSION,
     cfg.baseUrl.replace(/\/+$/, ''),
     cfg.model,
@@ -570,9 +582,21 @@ const TEMPERATURE = { term: 0, text: 0.2, block: 0.3, glossary: 0 };
 const temperatureOf = (job) => (job.repair ? 0 : TEMPERATURE[job.kind] ?? 0.2); // 补标记要的是听话，不是通顺
 
 /** 防止长段落被端点的默认输出上限截断；o 系 / gpt-5 换了字段名 */
-function tokenLimit(model, len) {
-  const n = Math.min(4096, Math.max(512, Math.ceil(len * 3)));
-  return /^(o[1-9]|gpt-5)/i.test(model) ? { max_completion_tokens: n } : { max_tokens: n };
+const MAX_OUTPUT_TOKENS = 4096;
+const initialOutputTokens = (length) => Math.min(MAX_OUTPUT_TOKENS, Math.max(512, Math.ceil(length * 3)));
+
+function tokenLimit(model, tokens) {
+  return /^(o[1-9]|gpt-5)/i.test(model)
+    ? { max_completion_tokens: tokens }
+    : { max_tokens: tokens };
+}
+
+function requestVariants(cfg, job, outputTokens) {
+  const tuning = { temperature: temperatureOf(job), ...tokenLimit(cfg.model, outputTokens) };
+  const extras = requestExtras(cfg);
+  return [{ ...tuning, ...extras }, tuning, {}].filter(
+    (variant, index, all) => index === 0 || JSON.stringify(variant) !== JSON.stringify(all[index - 1])
+  );
 }
 
 async function request(cfg, job, onChunk, signal) {
@@ -583,13 +607,10 @@ async function request(cfg, job, onChunk, signal) {
   const clean = (s) => stripEcho(stripThink(s), fingerprint);
   // 三档参数：全量 → 只留调参 → 一个不带。
   // 400 往下降一档并记住，因为 o 系拒绝 temperature、部分中转站拒绝一切未知字段。
-  const tuning = { temperature: temperatureOf(job), ...tokenLimit(cfg.model, job.text.length) };
-  const extras = requestExtras(cfg);
-  const variants = [{ ...tuning, ...extras }, tuning, {}].filter(
-    (v, i, all) => i === 0 || JSON.stringify(v) !== JSON.stringify(all[i - 1])
-  );
   const endpoint = url + cfg.model;
-  let level = Math.min(skipLevel.get(endpoint) ?? 0, variants.length - 1);
+  let outputTokens = initialOutputTokens(job.text.length);
+  let retriedTruncation = false;
+  let level = skipLevel.get(endpoint) ?? 0;
 
   // 内部 controller：把「用户中止」和「长时间无响应」合并成一个信号
   const ctrl = new AbortController();
@@ -613,21 +634,45 @@ async function request(cfg, job, onChunk, signal) {
   try {
     // 读配置期间就被取消（气泡关掉、译文收起）：一个字节都不用发
     if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
-    let res;
     for (;;) {
-      res = await post(variants[level]);
-      if (res.ok || res.status !== 400 || level >= variants.length - 1) break;
-      skipLevel.set(endpoint, ++level); // 本次会话内直接从这一档起步
+      const variants = requestVariants(cfg, job, outputTokens);
+      level = Math.min(level, variants.length - 1);
+      let res;
+      for (;;) {
+        res = await post(variants[level]);
+        if (res.ok || res.status !== 400 || level >= variants.length - 1) break;
+        skipLevel.set(endpoint, ++level); // 本次会话内直接从这一档起步
+        alive();
+      }
+      if (!res.ok) throw fail(await errorMessage(res), `http-${res.status}`);
+
+      const result = res.headers.get('content-type')?.includes('event-stream')
+        ? await readStream(res, (text) => onChunk(clean(text)), alive)
+        : await readJson(res);
+      const out = clean(result.text);
+      if (!['length', 'max_tokens'].includes(result.finishReason)) {
+        if (!out)
+          throw fail(
+            result.text
+              ? '模型没有翻译，只把提示词复述了一遍，换个模型试试'
+              : '模型没有返回内容，换个模型或稍后再试'
+          );
+        return out;
+      }
+
+      const nextTokens = MAX_OUTPUT_TOKENS;
+      const nextVariants = requestVariants(cfg, job, nextTokens);
+      const nextLevel = Math.min(level, nextVariants.length - 1);
+      const canIncrease =
+        !retriedTruncation &&
+        nextTokens > outputTokens &&
+        canonicalJson(variants[level]) !== canonicalJson(nextVariants[nextLevel]);
+      if (!canIncrease)
+        throw fail('模型输出达到长度上限，已停止以免显示或缓存不完整译文', 'truncated');
+      outputTokens = nextTokens;
+      retriedTruncation = true;
       alive();
     }
-    if (!res.ok) throw fail(await errorMessage(res), `http-${res.status}`);
-
-    const raw = res.headers.get('content-type')?.includes('event-stream')
-      ? await readStream(res, (text) => onChunk(clean(text)), alive)
-      : await readJson(res);
-    const out = clean(raw);
-    if (!out) throw fail(raw ? '模型没有翻译，只把提示词复述了一遍，换个模型试试' : '模型没有返回内容，换个模型或稍后再试');
-    return out;
   } catch (e) {
     if (signal?.aborted) throw e; // 用户主动取消，外层会忽略
     if (e.code === 'timeout' || ctrl.signal.reason?.code === 'timeout')
@@ -672,6 +717,7 @@ async function readStream(res, onChunk, alive) {
   const updates = createLatestEmitter(onChunk);
   let buf = '';
   let out = '';
+  let finishReason = '';
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -684,11 +730,13 @@ async function readStream(res, onChunk, alive) {
         if (!line.startsWith('data:')) continue;
         const payload = line.slice(5).trim();
         if (!payload || payload === '[DONE]') continue;
-        const delta = parseJson(payload)?.choices?.[0]?.delta;
+        const choice = parseJson(payload)?.choices?.[0];
+        const delta = choice?.delta;
         if (delta?.content) updates.push((out += delta.content)); // reasoning_content 直接忽略
+        if (choice?.finish_reason) finishReason = choice.finish_reason;
       }
     }
-    return out.trim();
+    return { text: out.trim(), finishReason };
   } finally {
     updates.cancel();
   }
@@ -696,7 +744,11 @@ async function readStream(res, onChunk, alive) {
 
 /** 端点不支持 stream 时的回退 */
 async function readJson(res) {
-  return (await res.json().catch(() => null))?.choices?.[0]?.message?.content?.trim() || '';
+  const choice = (await res.json().catch(() => null))?.choices?.[0];
+  return {
+    text: choice?.message?.content?.trim() || '',
+    finishReason: choice?.finish_reason || '',
+  };
 }
 
 /* ---------- 单词发音：Google TTS 取音频，交给 offscreen 页播放 ----------
