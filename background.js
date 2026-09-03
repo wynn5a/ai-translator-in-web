@@ -22,11 +22,16 @@ const trim = (map, max) => {
 /* ---------- 缓存：落盘，Service Worker 休眠后仍然有效 ---------- */
 
 let cache = null;
+let cacheLoading = null;
 let saveTimer;
 
 async function getCache() {
-  if (!cache) cache = new Map((await chrome.storage.local.get(CACHE_KEY))[CACHE_KEY] || []);
-  return cache;
+  if (cache) return cache;
+  cacheLoading ??= chrome.storage.local
+    .get(CACHE_KEY)
+    .then((stored) => (cache ??= new Map(stored[CACHE_KEY] || [])))
+    .finally(() => (cacheLoading = null));
+  return cacheLoading;
 }
 
 function saveCache() {
@@ -52,18 +57,22 @@ const EXTRACT_MIN = 120; // 更短的段落靠「短译文直接入表」就够�
 const EXTRACT_CONCURRENT = 2; // 术语抽取的并发上限，与翻译的名额分开算
 
 let glossary = null;
+let glossaryLoading = null;
 let glossaryTimer;
 let extracting = 0;
 
 async function getGlossary() {
-  if (!glossary)
-    glossary = new Map(
-      ((await chrome.storage.local.get(GLOSSARY_KEY))[GLOSSARY_KEY] || []).map(([scope, terms]) => [
-        scope,
-        new Map(terms),
-      ])
-    );
-  return glossary;
+  if (glossary) return glossary;
+  glossaryLoading ??= chrome.storage.local
+    .get(GLOSSARY_KEY)
+    .then(
+      (stored) =>
+        (glossary ??= new Map(
+          (stored[GLOSSARY_KEY] || []).map(([scope, terms]) => [scope, new Map(terms)])
+        ))
+    )
+    .finally(() => (glossaryLoading = null));
+  return glossaryLoading;
 }
 
 function saveGlossary() {
@@ -749,6 +758,15 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 });
 
+/** 清空时先替换内存实例；尚未完成的冷启动读取随后只能拿到这两张新空表。 */
+async function clearStoredData() {
+  cache = new Map();
+  glossary = new Map();
+  clearTimeout(saveTimer);
+  clearTimeout(glossaryTimer);
+  await chrome.storage.local.remove([CACHE_KEY, GLOSSARY_KEY]);
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.target === 'offscreen') return false; // 发给播放页的消息，这里不管
   switch (msg?.type) {
@@ -768,11 +786,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       chrome.runtime.openOptionsPage();
       return false;
     case 'clearCache':
-      cache = new Map();
-      glossary = new Map();
-      clearTimeout(saveTimer);
-      clearTimeout(glossaryTimer);
-      chrome.storage.local.remove([CACHE_KEY, GLOSSARY_KEY]).then(() => sendResponse({ ok: true }));
+      clearStoredData().then(() => sendResponse({ ok: true }));
       return true;
     default:
       return false;
