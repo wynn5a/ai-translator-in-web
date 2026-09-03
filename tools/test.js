@@ -278,6 +278,7 @@ test('缓存键覆盖所有影响提示词和请求行为的输入', () => {
     [cacheCfg, { ...cacheJob, surrounding: { before: 'Previous paragraph' } }],
   ];
   for (const [cfg, job] of changed) assert.notEqual(background.cacheKeyFor(cfg, job), key);
+  assert.notEqual(background.cacheKeyFor(cacheCfg, cacheJob, [[['paragraph', '段落']]]), key);
 });
 
 test('缓存键忽略密钥、profile 名称和无意义的 JSON 顺序', () => {
@@ -300,6 +301,37 @@ test('缓存键忽略密钥、profile 名称和无意义的 JSON 顺序', () => 
   assert.ok(!key.includes(second.apiKey));
   assert.ok(!key.includes(first.name));
   assert.ok(!key.includes(second.name));
+});
+
+test('相关术语更新后不命中旧译文缓存', async () => {
+  const isolated = loadBackground();
+  isolated.testCfg = { ...cacheCfg };
+  isolated.requests = [];
+  isolated.read(`
+    cache = new Map();
+    glossary = new Map([['example.com\\x01简体中文', new Map([['paragraph', '段落']])]]);
+    loadConfig = async () => ({ active: testCfg });
+    request = async (_cfg, job) => {
+      requests.push(job.terms);
+      return requests.length === 1 ? '首稿' : '新译文';
+    };
+  `);
+  const job = { ...cacheJob, text: 'Translate this paragraph.' };
+
+  assert.equal((await isolated.translateWithContext(job)).text, '首稿');
+  assert.equal((await isolated.translateWithContext(job)).text, '首稿', '术语未变时应命中缓存');
+  await isolated.remember('example.com\x01简体中文', 'unrelated', '无关');
+  assert.equal((await isolated.translateWithContext(job)).text, '首稿', '无关术语不应让缓存失效');
+  await isolated.remember('example.com\x01简体中文', 'paragraph', '段');
+  assert.equal((await isolated.translateWithContext(job)).text, '新译文', '术语变化后必须重新翻译');
+  assert.deepEqual(
+    [...isolated.requests].map((terms) => [...terms].map((term) => [...term])),
+    [
+      [['paragraph', '段落']],
+      [['paragraph', '段']],
+    ]
+  );
+  isolated.read('clearTimeout(saveTimer); clearTimeout(glossaryTimer)');
 });
 
 /* ---------- 流式更新合并 ---------- */
