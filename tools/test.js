@@ -110,6 +110,28 @@ test('分片拼回原文一字不差', () => {
   assert.equal(rejoin(chunks), src);
 });
 
+test('没有句子断点时，硬切也不能落在结构标记内部', () => {
+  const markers = ['<t1>', '</t1>', '<x2/>', '<n3/>', '<b4>', '</b4>'];
+  for (const marker of markers) {
+    for (let inside = 1; inside < marker.length; inside++) {
+      const src = `${'a'.repeat(CHUNK_LIMIT - inside)}${marker}${'b'.repeat(CHUNK_LIMIT)}`;
+      const chunks = splitChunks(src);
+      assert.equal(rejoin(chunks), src, `${marker} 的第 ${inside} 个字符处`);
+
+      let boundary = 0;
+      for (const chunk of chunks.slice(0, -1)) {
+        boundary += chunk.text.length + chunk.sep.length;
+        const markerStart = src.indexOf(marker);
+        const markerEnd = markerStart + marker.length;
+        assert.ok(
+          boundary <= markerStart || boundary >= markerEnd,
+          `切点 ${boundary} 落在 ${marker} 内部（${markerStart}–${markerEnd}）`
+        );
+      }
+    }
+  }
+});
+
 test('切点绝不落在行内标记内部', () => {
   const inner = '这是一段被 t 标记包住的很长的文字，中间有。句号，也有 English. sentences. '.repeat(30);
   const src = `开头。<t1>${inner}</t1>结尾。`;
@@ -197,6 +219,20 @@ test('标记完整性检查：漏掉的标记被点名，写歪的不算漏', ()
   assert.deepEqual(missingTags(src, '点 <t1>这里</t1> 运行 <x2/>\n<b3>第二段</b3>'), ['<n/>']);
   assert.deepEqual(missingTags('A。<n1/>\n<n2/>\nB。', 'A。<n7/><n8/>B。'), [], '换行标记只数个数');
   assert.deepEqual(missingTags('用 <t1>List</t1>', '用 List<T1>'), ['<t1>', '</t1>'], '大写泛型不是标记');
+});
+
+test('术语收集沿用翻译开始时的配置上下文', async () => {
+  const scope = 'docs.example\x01简体中文';
+  const result = {
+    text: '共享模块',
+    cfg: { targetLang: '简体中文', glossary: true },
+    scope,
+    fromCache: false,
+  };
+  await background.harvest({ kind: 'term', text: 'shared module' }, result);
+  const glossary = await background.getGlossary();
+  assert.equal(glossary.get(scope).get('shared module'), '共享模块');
+  background.read('clearTimeout(glossaryTimer)');
 });
 
 test('补标记的重发提示词点名缺失的标记，且温度为 0', () => {
