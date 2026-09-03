@@ -354,19 +354,34 @@ function breakpoints(text) {
   return stops;
 }
 
+/** 硬切点落在标记里面时挪到标记前；标记本身比整片还长时才挪到标记后，避免空片死循环 */
+function markerSafeCut(source, start, cut) {
+  const markerStart = source.lastIndexOf('<', cut - 1);
+  if (markerStart < start) return cut;
+  const marker = markerAt(source, markerStart);
+  if (!marker || markerStart + marker[0].length <= cut) return cut;
+  return markerStart > start ? markerStart : markerStart + marker[0].length;
+}
+
 /** 切成 [{ text, sep }]，sep 是被 trim 掉的分隔空白，拼回译文时补上 */
 function splitChunks(source, limit = CHUNK_LIMIT) {
   if (source.length <= limit) return [{ text: source, sep: '' }];
   const stops = breakpoints(source);
   const chunks = [];
+  let stopIndex = 0;
   for (let start = 0; start < source.length; ) {
     const room = start + limit;
     let cut = source.length;
     if (room < source.length) {
-      const reach = stops.filter((s) => s.at > start && s.at <= room);
-      const hard = reach.filter((s) => s.hard).pop();
+      while (stops[stopIndex]?.at <= start) stopIndex++;
+      let soft;
+      let hard;
+      for (let i = stopIndex; i < stops.length && stops[i].at <= room; i++) {
+        soft = stops[i];
+        if (soft.hard) hard = soft;
+      }
       // 段落边界优先，但太靠前就宁可用句子边界，免得切出很碎的片
-      cut = (hard && hard.at - start >= limit * 0.6 ? hard : reach.pop())?.at ?? room;
+      cut = (hard && hard.at - start >= limit * 0.6 ? hard : soft)?.at ?? markerSafeCut(source, start, room);
     }
     const raw = source.slice(start, cut);
     const text = raw.trimEnd();
@@ -418,15 +433,13 @@ async function translateOne(cfg, sub, onChunk, signal) {
 
 /* ---------- 主流程 ---------- */
 
-/**
- * job: { kind, text, context, page, tagged }；逐块回调译文增量，返回完整译文。
- * 命中缓存时会在 job 上打一个 fromCache 标记，供随后的 harvest 判断要不要抽术语。
- */
-async function translate(job, onChunk = () => {}, signal) {
+/** 一次翻译固定使用同一份配置，并把后处理需要的上下文随结果返回。 */
+async function translateWithContext(job, onChunk = () => {}, signal) {
   const { active: cfg } = await loadConfig(); // 当前 profile，切换后下一次翻译立即生效
   if (!cfg.apiKey) throw fail('还没有配置 API Key', 'no-key');
 
   const c = await getCache();
+  const scope = scopeOf(cfg, job.page);
   // 端点也参与 key：两个 profile 用同名模型指向不同服务时，译文不能互相串
   // 页面标题参与 key：它进了提示词，换页面同一句话的译法可能不同
   const key = [
@@ -444,8 +457,7 @@ async function translate(job, onChunk = () => {}, signal) {
   if (hit !== undefined) {
     c.delete(key), c.set(key, hit); // 命中即刷新为最近使用；只是换了顺序，不值得整张表重写一遍落盘
     onChunk(hit);
-    job.fromCache = true; // 这段的术语上次已经抽过了，别再花一次请求（见 harvest）
-    return hit;
+    return { text: hit, cfg, scope, fromCache: true };
   }
 
   // 命中缓存不占名额；真正要发请求时才计数，满了直接拒绝
@@ -453,7 +465,6 @@ async function translate(job, onChunk = () => {}, signal) {
   inFlight++;
   try {
     // 分片只占一个并发名额：它们本来就是串行的
-    const scope = scopeOf(cfg, job.page);
     const out = await translateChunks(cfg, { ...job, scope }, splitChunks(job.text), onChunk, signal);
     c.set(key, out);
     for (const k of c.keys()) {
@@ -461,10 +472,15 @@ async function translate(job, onChunk = () => {}, signal) {
       c.delete(k);
     }
     saveCache();
-    return out;
+    return { text: out, cfg, scope, fromCache: false };
   } finally {
     inFlight--;
   }
+}
+
+/** 对设置页等只关心译文的调用方保留简单接口。 */
+async function translate(job, onChunk = () => {}, signal) {
+  return (await translateWithContext(job, onChunk, signal)).text;
 }
 
 /* ---------- 往术语表里记：翻译完成之后才做，不占用户等待时间 ---------- */
@@ -474,9 +490,8 @@ const visible = (text) => stripMarkers(text).trim(); // 去掉结构占位标记
 /** 整块就是一个词组的译文（标题、表头、按钮、链接文字），可以直接当术语用 */
 const isPhrase = (s) => s.length <= TERM_MAX && !s.includes('\n') && s.split(/\s+/).length <= 6;
 
-async function harvest(job, out, signal) {
-  const { active: cfg } = await loadConfig();
-  const scope = scopeOf(cfg, job.page);
+async function harvest(job, result, signal) {
+  const { text: out, cfg, scope, fromCache } = result;
   if (!scope || !out) return;
 
   // 查词的结果本身就是一条对照；模型给了「甲/乙」两个说法时只取第一个
@@ -485,7 +500,7 @@ async function harvest(job, out, signal) {
   const source = visible(job.text);
   const target = visible(out);
   if (isPhrase(source) && isPhrase(target)) return remember(scope, source, target);
-  if (!cfg.glossary || job.fromCache || source.length < EXTRACT_MIN) return;
+  if (!cfg.glossary || fromCache || source.length < EXTRACT_MIN) return;
   if (extracting >= EXTRACT_CONCURRENT) return; // 抽术语是可选项，挤不进去就算了
 
   extracting++;
@@ -665,11 +680,15 @@ chrome.runtime.onConnect.addListener((port) => {
 
   port.onMessage.addListener(async (job) => {
     try {
-      const out = await translate(job, (p) => alive && port.postMessage({ chunk: p }), ctrl.signal);
-      if (alive) port.postMessage({ done: true, text: out });
+      const result = await translateWithContext(
+        job,
+        (text) => alive && port.postMessage({ chunk: text }),
+        ctrl.signal
+      );
+      if (alive) port.postMessage({ done: true, text: result.text });
       // 先把译文交给用户，再抽术语。端口留到这一步之后才断，
       // Service Worker 便不会在抽取途中被回收（收起译文会中止它）
-      await harvest(job, out, ctrl.signal);
+      await harvest(job, result, ctrl.signal);
     } catch (e) {
       if (alive && e.name !== 'AbortError') port.postMessage({ error: e.message, code: e.code });
     }
