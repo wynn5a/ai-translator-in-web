@@ -348,6 +348,69 @@ test('流式完成或中止时取消尚未发送的旧帧', () => {
   assert.deepEqual(emitted, []);
 });
 
+/* ---------- 冷启动存储 ---------- */
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => (resolve = done));
+  return { promise, resolve };
+}
+
+test('并发冷启动只读取一次并共享同一份缓存', async () => {
+  const isolated = loadBackground();
+  const load = deferred();
+  let reads = 0;
+  isolated.chrome.storage.local.get = () => {
+    reads++;
+    return load.promise;
+  };
+
+  const first = isolated.getCache();
+  const second = isolated.getCache();
+  assert.equal(reads, 1);
+
+  load.resolve({ __cache: [['source', 'target']] });
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a, b);
+  assert.equal(a.get('source'), 'target');
+});
+
+test('并发冷启动只读取一次并共享同一份术语表', async () => {
+  const isolated = loadBackground();
+  const load = deferred();
+  let reads = 0;
+  isolated.chrome.storage.local.get = () => {
+    reads++;
+    return load.promise;
+  };
+
+  const first = isolated.getGlossary();
+  const second = isolated.getGlossary();
+  assert.equal(reads, 1);
+
+  load.resolve({ __glossary: [['example.com\x01简体中文', [['term', '术语']]]] });
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a, b);
+  assert.equal(a.get('example.com\x01简体中文').get('term'), '术语');
+});
+
+test('清空操作不会被尚未完成的冷启动读取回填', async () => {
+  const isolated = loadBackground();
+  const cacheLoad = deferred();
+  const glossaryLoad = deferred();
+  isolated.chrome.storage.local.get = (key) => (key === '__cache' ? cacheLoad.promise : glossaryLoad.promise);
+
+  const pendingCache = isolated.getCache();
+  const pendingGlossary = isolated.getGlossary();
+  await isolated.clearStoredData();
+
+  cacheLoad.resolve({ __cache: [['old', '旧译文']] });
+  glossaryLoad.resolve({ __glossary: [['old-scope', [['old', '旧术语']]]] });
+  const [cache, glossary] = await Promise.all([pendingCache, pendingGlossary]);
+  assert.equal(cache.size, 0);
+  assert.equal(glossary.size, 0);
+});
+
 test('补标记的重发提示词点名缺失的标记，且温度为 0', () => {
   const sys = systemOf({ kind: 'block', text: 'x', tagged: true, repair: ['<t1>', '</t1>'] });
   assert.ok(sys.includes('<t1> </t1>'));
