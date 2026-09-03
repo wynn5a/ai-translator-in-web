@@ -334,7 +334,58 @@ test('相关术语更新后不命中旧译文缓存', async () => {
   isolated.read('clearTimeout(saveTimer); clearTimeout(glossaryTimer)');
 });
 
-/* ---------- 流式更新合并 ---------- */
+/* ---------- 前后台流式通信 ---------- */
+
+function fakePort() {
+  let receive;
+  let disconnect;
+  return {
+    port: {
+      onMessage: { addListener: (listener) => (receive = listener) },
+      onDisconnect: { addListener: (listener) => (disconnect = listener) },
+      postMessage() {},
+      disconnect() {},
+    },
+    receive: (message) => receive(message),
+    drop: () => disconnect(),
+  };
+}
+
+test('流式连接中断时不把已收到的半截当成完整译文', async () => {
+  const isolated = loadContent();
+  const channel = fakePort();
+  let cancelledFrame = 0;
+  const painted = [];
+  isolated.chrome.runtime.connect = () => channel.port;
+  isolated.requestAnimationFrame = () => 7;
+  isolated.cancelAnimationFrame = (frame) => (cancelledFrame = frame);
+
+  const task = isolated.requestTranslation({ kind: 'text', text: 'source' }, (text) => painted.push(text));
+  channel.receive({ chunk: '未完成的译' });
+  channel.drop();
+
+  const result = await task;
+  assert.equal(result.text, undefined);
+  assert.equal(result.error, '连接中断，请重试');
+  assert.equal(result.code, 'disconnect');
+  assert.equal(cancelledFrame, 7, '排队中的半截不能在错误提示后重新画出来');
+  assert.deepEqual(painted, []);
+});
+
+test('收到完成消息后端口正常关闭仍保留完整译文', async () => {
+  const isolated = loadContent();
+  const channel = fakePort();
+  isolated.chrome.runtime.connect = () => channel.port;
+  isolated.cancelAnimationFrame = () => {};
+
+  const task = isolated.requestTranslation({ kind: 'text', text: 'source' }, () => {});
+  channel.receive({ done: true, text: '完整译文' });
+  channel.drop();
+
+  assert.equal((await task).text, '完整译文');
+});
+
+/* ---------- 后台流式更新合并 ---------- */
 
 function fakeTimers() {
   const pending = new Map();
