@@ -427,11 +427,12 @@ function splitChunks(source, limit = CHUNK_LIMIT) {
 async function translateChunks(cfg, job, chunks, onChunk, signal) {
   let done = '';
   for (let i = 0; i < chunks.length; i++) {
-    const { text, sep } = chunks[i];
+    const { text, sep, terms } = chunks[i];
     const sub = {
       ...job,
       text,
-      terms: await glossaryFor(job.scope, text), // 按分片各自命中的术语注入，不整段全发
+      // 首层分片已经固定了术语快照供缓存键复用；截断恢复产生的新分片则在这里读取
+      terms: terms ?? (await glossaryFor(job.scope, text)),
       carry: done ? done.trimEnd().slice(-160) : job.carry || '',
       part: chunks.length > 1 ? [i + 1, chunks.length] : null,
     };
@@ -485,8 +486,8 @@ function canonicalJson(value) {
   return JSON.stringify(canonical(value));
 }
 
-/** 只纳入会改变提示词或请求行为的配置；API Key 和 profile 名称绝不进入缓存。 */
-function cacheKeyFor(cfg, job) {
+/** 只纳入会改变请求的输入，排除 API Key 和 profile 名称；chunkTerms 是各分片实际注入的术语。 */
+function cacheKeyFor(cfg, job, chunkTerms = []) {
   return canonicalJson([
     CACHE_VERSION,
     PROMPT_VERSION,
@@ -504,6 +505,7 @@ function cacheKeyFor(cfg, job) {
     job.surrounding || null,
     job.context || '',
     job.text,
+    chunkTerms,
   ]);
 }
 
@@ -512,9 +514,24 @@ async function translateWithContext(job, onChunk = () => {}, signal) {
   const { active: cfg } = await loadConfig(); // 当前 profile，切换后下一次翻译立即生效
   if (!cfg.apiKey) throw fail('还没有配置 API Key', 'no-key');
 
-  const c = await getCache();
   const scope = scopeOf(cfg, job.page);
-  const key = cacheKeyFor(cfg, job);
+  const chunks = splitChunks(job.text);
+  // 缓存必须与真正注入每个分片的术语一致，否则术语更新后还会命中旧译文。
+  // 同时读取两份 storage，冷启动时不互相阻塞。
+  const [c, preparedChunks] = await Promise.all([
+    getCache(),
+    Promise.all(
+      chunks.map(async (chunk) => ({
+        ...chunk,
+        terms: await glossaryFor(scope, chunk.text),
+      }))
+    ),
+  ]);
+  const key = cacheKeyFor(
+    cfg,
+    job,
+    preparedChunks.map(({ terms }) => terms)
+  );
   const hit = c.get(key);
   if (hit !== undefined) {
     c.delete(key), c.set(key, hit); // 命中即刷新为最近使用；只是换了顺序，不值得整张表重写一遍落盘
@@ -527,7 +544,7 @@ async function translateWithContext(job, onChunk = () => {}, signal) {
   inFlight++;
   try {
     // 分片只占一个并发名额：它们本来就是串行的
-    const out = await translateChunks(cfg, { ...job, scope }, splitChunks(job.text), onChunk, signal);
+    const out = await translateChunks(cfg, { ...job, scope }, preparedChunks, onChunk, signal);
     c.set(key, out);
     for (const k of c.keys()) {
       if (c.size <= CACHE_MAX) break;
