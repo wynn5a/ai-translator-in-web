@@ -403,10 +403,15 @@ function speakButton(text, lang) {
 
 function requestTranslation(payload, onPartial) {
   let port;
+  let finish = () => {};
+  let close = () => {};
+  let cancelRequested = false;
+  const closed = new Promise((resolve) => (close = resolve));
   const task = new Promise((resolve) => {
     try {
       port = chrome.runtime.connect();
     } catch {
+      close();
       return resolve({ error: '扩展已更新或被禁用，请刷新页面后重试', code: 'reload' });
     }
     let partial = '';
@@ -414,7 +419,7 @@ function requestTranslation(payload, onPartial) {
     // 模型每吐几个字就来一条消息，逐条重建 DOM 和排版跟不上；一帧只画最新的那份
     let frame = 0;
     const paint = () => ((frame = 0), onPartial(partial));
-    const finish = (result) => {
+    finish = (result) => {
       if (settled) return;
       settled = true;
       cancelAnimationFrame(frame); // 终稿或错误马上处理，不让排队中的旧分片随后覆盖它
@@ -429,10 +434,38 @@ function requestTranslation(payload, onPartial) {
       else if (m.done) finish({ text: m.text });
     });
     // 未收到 done 的分片不是完整译文，不能因为端口中断就把它当成功结果。
-    port.onDisconnect.addListener(() => finish({ error: '连接中断，请重试', code: 'disconnect' }));
-    port.postMessage(payload);
+    port.onDisconnect.addListener(() => {
+      close();
+      finish(
+        cancelRequested
+          ? { cancelled: true }
+          : { error: '连接中断，请重试', code: 'disconnect' }
+      );
+    });
+    try {
+      port.postMessage(payload);
+    } catch {
+      finish({ error: '扩展已更新或被禁用，请刷新页面后重试', code: 'reload' });
+      close();
+      try {
+        port.disconnect();
+      } catch {
+        /* 端口本来就不可用 */
+      }
+    }
   });
-  task.cancel = () => port?.disconnect(); // 断开即中止后台请求
+  task.cancel = () => {
+    if (cancelRequested) return;
+    cancelRequested = true;
+    finish({ cancelled: true }); // 不必等 onDisconnect，调用方可以立即结束自己的 UI 生命周期
+    close();
+    try {
+      port?.disconnect(); // 断开即中止后台请求；done 之后调用则中止后台术语收集
+    } catch {
+      /* 端口已由后台关闭 */
+    }
+  };
+  task.closed = closed; // done 只表示译文已交付；closed 才表示后台后处理也结束
   return task;
 }
 
@@ -445,20 +478,42 @@ function errorActions(code, retry) {
 /* ---------- 划词翻译 ---------- */
 
 /** range 可能为 null（选区节点已被页面替换，只剩文本） */
-async function runSelection(text, range) {
+function liveRange(range) {
+  try {
+    return range?.startContainer?.isConnected ? range : null;
+  } catch {
+    return null;
+  }
+}
+
+async function runSelection(text, range, retryJob = null) {
+  pending?.cancel(); // 新的划词任务取代旧任务，不能只忽略旧结果而让它继续占并发和额度
+  pending = null;
+  range = liveRange(range); // 报错后页面可能已经替换了原选区节点
   openAt(range ? rangeAnchor(range) : pointAnchor());
-  const context = range && isTerm(text) ? sentenceAround(range) : '';
   showTip(dots());
 
-  const job = { kind: context ? 'term' : 'text', text, context, page: pageBrief() };
+  const context = retryJob ? retryJob.context : range && isTerm(text) ? sentenceAround(range) : '';
+  // 重试沿用第一次的语境快照，避免页面变化后悄悄变成另一项任务；后台仍会读取最新 profile。
+  const job = retryJob || { kind: context ? 'term' : 'text', text, context, page: pageBrief() };
   const task = (pending = requestTranslation(job, (p) => pending === task && showTip(p)));
-  const { text: out, error, code } = await task;
+  const { text: out, error, code, cancelled } = await task;
   if (pending !== task) return; // 已被 Esc / 点击 / 新的翻译取代
-  pending = null;
-  if (error) return showTip(error, { error: true, actions: errorActions(code, () => runSelection(text, range)) });
+  if (cancelled) return (pending = null);
+  if (error) {
+    pending = null;
+    return showTip(error, {
+      error: true,
+      actions: errorActions(code, () => runSelection(text, range, job)),
+    });
+  }
   // 只挂在最终译文上：流式过程中每个分片都会重建正文，按钮会一直闪
   const lang = speakLang(text);
   showTip(out, { inline: lang ? speakButton(text, lang) : null });
+  // 译文到达后后台可能还在抽术语；保留句柄，让关闭气泡或发起新任务可以中止它。
+  task.closed.then(() => {
+    if (pending === task) pending = null;
+  });
 }
 
 /* ---------- 段落翻译：复制原段落样式插入译文 ---------- */
@@ -714,11 +769,17 @@ async function runBlock(block, force) {
     else task.cancel(); // 页面变化导致节点消失，停止请求
   });
   running.set(target, task);
+  task.closed.then(() => {
+    if (running.get(target) === task) running.delete(target);
+  });
 
-  const { text, error, code } = await task;
-  running.delete(target);
+  const { text, error, code, cancelled } = await task;
+  if (cancelled) return;
   if (!target.isConnected) return;
-  if (error) blockError(block, target, error, code);
+  if (error) {
+    running.delete(target); // 错误之后没有后台后处理，重试不需要先取消旧任务
+    blockError(block, target, error, code);
+  }
   else render(target, text, parts);
 }
 

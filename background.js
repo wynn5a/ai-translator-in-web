@@ -11,6 +11,11 @@ const skipLevel = new Map(); // 端点+模型 → 参数降级到第几档，避
 
 const fail = (message, code) => Object.assign(new Error(message), { code });
 
+/** 在耗时初始化和每次重试前都检查，避免已经取消的任务继续命中缓存或发出新请求。 */
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+}
+
 /** Map 按插入顺序淘汰最旧的，直到不超过 max */
 const trim = (map, max) => {
   for (const k of map.keys()) {
@@ -95,7 +100,8 @@ const appears = (term, text) =>
   LATIN.test(term) ? new RegExp(`(^|[^\\w])${escapeRe(term)}([^\\w]|$)`, 'i').test(text) : text.includes(term);
 
 /** 记一条术语；后来的译法覆盖先前的，并刷新为最近使用 */
-async function remember(scope, term, target) {
+async function remember(scope, term, target, signal) {
+  throwIfAborted(signal);
   term = term.trim();
   target = target.trim();
   if (!scope || !term || !target) return;
@@ -104,6 +110,7 @@ async function remember(scope, term, target) {
   if (!HAS_LETTER.test(term)) return; // 纯数字、纯符号不是术语
 
   const g = await getGlossary();
+  throwIfAborted(signal);
   const terms = g.get(scope) || new Map();
   g.delete(scope), g.set(scope, terms); // 作用域也按 LRU
   terms.delete(term), terms.set(term, target);
@@ -511,7 +518,9 @@ function cacheKeyFor(cfg, job, chunkTerms = []) {
 
 /** 一次翻译固定使用同一份配置，并把后处理需要的上下文随结果返回。 */
 async function translateWithContext(job, onChunk = () => {}, signal) {
+  throwIfAborted(signal);
   const { active: cfg } = await loadConfig(); // 当前 profile，切换后下一次翻译立即生效
+  throwIfAborted(signal);
   if (!cfg.apiKey) throw fail('还没有配置 API Key', 'no-key');
 
   const scope = scopeOf(cfg, job.page);
@@ -527,6 +536,7 @@ async function translateWithContext(job, onChunk = () => {}, signal) {
       }))
     ),
   ]);
+  throwIfAborted(signal);
   const key = cacheKeyFor(
     cfg,
     job,
@@ -570,15 +580,16 @@ const visible = (text) => stripMarkers(text).trim(); // 去掉结构占位标记
 const isPhrase = (s) => s.length <= TERM_MAX && !s.includes('\n') && s.split(/\s+/).length <= 6;
 
 async function harvest(job, result, signal) {
+  throwIfAborted(signal);
   const { text: out, cfg, scope, fromCache } = result;
   if (!scope || !out) return;
 
   // 查词的结果本身就是一条对照；模型给了「甲/乙」两个说法时只取第一个
-  if (job.kind === 'term') return remember(scope, job.text, out.split(/[/／]/)[0]);
+  if (job.kind === 'term') return remember(scope, job.text, out.split(/[/／]/)[0], signal);
 
   const source = visible(job.text);
   const target = visible(out);
-  if (isPhrase(source) && isPhrase(target)) return remember(scope, source, target);
+  if (isPhrase(source) && isPhrase(target)) return remember(scope, source, target, signal);
   if (!cfg.glossary || fromCache || source.length < EXTRACT_MIN) return;
   if (extracting >= EXTRACT_CONCURRENT) return; // 抽术语是可选项，挤不进去就算了
 
@@ -602,7 +613,7 @@ async function extractTerms(cfg, scope, source, target, signal) {
     if (at < 1) continue;
     const term = line.slice(0, at).trim();
     // 模型偶尔会编出原文里没有的词，或者把整句塞进来，一律丢掉
-    if (term && appears(term, source)) await remember(scope, term, line.slice(at + 1));
+    if (term && appears(term, source)) await remember(scope, term, line.slice(at + 1), signal);
   }
 }
 
@@ -664,14 +675,17 @@ async function request(cfg, job, onChunk, signal) {
   alive();
   try {
     // 读配置期间就被取消（气泡关掉、译文收起）：一个字节都不用发
-    if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+    throwIfAborted(signal);
     for (;;) {
+      throwIfAborted(ctrl.signal);
       const variants = requestVariants(cfg, job, outputTokens);
       level = Math.min(level, variants.length - 1);
       let res;
       for (;;) {
+        throwIfAborted(ctrl.signal);
         res = await post(variants[level]);
         if (res.ok || res.status !== 400 || level >= variants.length - 1) break;
+        await Promise.resolve(res.body?.cancel?.()).catch(() => {});
         skipLevel.set(endpoint, ++level); // 本次会话内直接从这一档起步
         alive();
       }
@@ -823,21 +837,39 @@ async function speak(text, lang) {
 chrome.runtime.onConnect.addListener((port) => {
   const ctrl = new AbortController();
   let alive = true;
-  port.onDisconnect.addListener(() => ((alive = false), ctrl.abort())); // 气泡关掉就中止请求
+  let started = false;
+  const cancel = () => {
+    if (!alive) return;
+    alive = false;
+    ctrl.abort();
+  };
+  const post = (message) => {
+    if (!alive) return false;
+    try {
+      port.postMessage(message);
+      return true;
+    } catch {
+      cancel(); // 端口刚好在 alive 检查之后断开
+      return false;
+    }
+  };
+  port.onDisconnect.addListener(cancel); // 气泡关掉就中止请求
 
   port.onMessage.addListener(async (job) => {
+    if (started) return; // 一个端口只代表一个任务；重试必须建立新端口和新取消信号
+    started = true;
     try {
       const result = await translateWithContext(
         job,
-        (text) => alive && port.postMessage({ chunk: text }),
+        (text) => post({ chunk: text }),
         ctrl.signal
       );
-      if (alive) port.postMessage({ done: true, text: result.text });
+      if (!post({ done: true, text: result.text })) return;
       // 先把译文交给用户，再抽术语。端口留到这一步之后才断，
       // Service Worker 便不会在抽取途中被回收（收起译文会中止它）
       await harvest(job, result, ctrl.signal);
     } catch (e) {
-      if (alive && e.name !== 'AbortError') port.postMessage({ error: e.message, code: e.code });
+      if (alive && e.name !== 'AbortError') post({ error: e.message, code: e.code });
     }
     if (alive) port.disconnect();
   });

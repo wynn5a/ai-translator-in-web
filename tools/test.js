@@ -251,6 +251,28 @@ test('术语收集沿用翻译开始时的配置上下文', async () => {
   background.read('clearTimeout(glossaryTimer)');
 });
 
+test('译文交付后取消时不再把尚未完成的术语写入表中', async () => {
+  const isolated = loadBackground();
+  const glossaryLoad = deferred();
+  isolated.chrome.storage.local.get = () => glossaryLoad.promise;
+  const ctrl = new AbortController();
+  const harvest = isolated.harvest(
+    { kind: 'term', text: 'shared module' },
+    {
+      text: '共享模块',
+      cfg: { targetLang: '简体中文', glossary: true },
+      scope: 'docs.example\x01简体中文',
+      fromCache: false,
+    },
+    ctrl.signal
+  );
+
+  ctrl.abort();
+  glossaryLoad.resolve({});
+  await assert.rejects(harvest, (error) => error.name === 'AbortError');
+  assert.equal((await isolated.getGlossary()).size, 0);
+});
+
 /* ---------- 缓存键 ---------- */
 
 const cacheCfg = {
@@ -383,6 +405,40 @@ test('收到完成消息后端口正常关闭仍保留完整译文', async () =>
   channel.drop();
 
   assert.equal((await task).text, '完整译文');
+});
+
+test('主动取消立即结束任务，端口随后断开也不误报连接错误', async () => {
+  const isolated = loadContent();
+  const channel = fakePort();
+  isolated.chrome.runtime.connect = () => channel.port;
+  isolated.cancelAnimationFrame = () => {};
+
+  const task = isolated.requestTranslation({ kind: 'text', text: 'source' }, () => {});
+  task.cancel();
+  channel.drop();
+
+  assert.equal((await task).cancelled, true);
+  await task.closed;
+});
+
+test('译文交付和后台任务关闭是两个独立阶段', async () => {
+  const isolated = loadContent();
+  const channel = fakePort();
+  isolated.chrome.runtime.connect = () => channel.port;
+  isolated.cancelAnimationFrame = () => {};
+
+  const task = isolated.requestTranslation({ kind: 'text', text: 'source' }, () => {});
+  channel.receive({ done: true, text: '完整译文' });
+  assert.equal((await task).text, '完整译文');
+
+  let closed = false;
+  task.closed.then(() => (closed = true));
+  await Promise.resolve();
+  assert.equal(closed, false, 'done 后仍可通过同一个任务句柄取消后台术语收集');
+
+  channel.drop();
+  await task.closed;
+  assert.equal(closed, true);
 });
 
 /* ---------- 后台流式更新合并 ---------- */
@@ -545,6 +601,27 @@ test('截断且无法恢复的译文不会进入缓存', async () => {
     (error) => error.code === 'truncated'
   );
   assert.equal((await isolated.getCache()).size, 0);
+});
+
+test('初始化期间取消的任务不会命中缓存或发出请求', async () => {
+  const isolated = loadBackground();
+  const configLoad = deferred();
+  let requests = 0;
+  isolated.fetch = async () => {
+    requests++;
+    return jsonResponse('不应发出', 'stop');
+  };
+  isolated.configLoad = configLoad.promise;
+  isolated.testCfg = { ...cacheCfg };
+  isolated.read('loadConfig = async () => (await configLoad, { active: testCfg })');
+
+  const ctrl = new AbortController();
+  const task = isolated.translateWithContext({ kind: 'text', text: 'source' }, () => {}, ctrl.signal);
+  ctrl.abort();
+  configLoad.resolve();
+
+  await assert.rejects(task, (error) => error.name === 'AbortError');
+  assert.equal(requests, 0);
 });
 
 test('最大 token 仍截断时自动把源文分成更小的安全分片', async () => {
