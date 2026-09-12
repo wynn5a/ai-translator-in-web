@@ -459,18 +459,51 @@ async function translateChunks(cfg, job, chunks, onChunk, signal) {
   return done;
 }
 
+/** 首稿押住不上屏的可见字符上限：押满就放弃押注照常流式——
+    再长的段落一直不显示就像卡死，长段首稿丢标记时退回旧的替换策略。 */
+const DRAFT_HOLD = 300;
+/** 押稿只赌「原文开头就有结构」的段落：首个标记埋得比这更深的段落，
+    译文开头多半也没有标记，押住只会白等，不如照常流式。 */
+const HOLD_SOURCE_HEAD = 200;
+
+/**
+ * 带标记的首稿在结构被证实之前先不上屏：正常的译文开头几个字里就有标记，
+ * 标记一出现立刻放行、照常流式；迟迟不出现，说明模型多半丢了标记——
+ * 这种首稿整个押住不显示（页面停在加载动画上），等补发结果直接以正确排版
+ * 一次画好，而不是「流式显示一份纯文本、完成后又按格式重排一遍」。
+ */
+function gateDraft(sub, onChunk) {
+  if (!sub.tagged || sub.repair) return onChunk;
+  const first = markerMatches(sub.text).next();
+  if (!first.done && stripMarkers(sub.text.slice(0, first.value.index)).length <= HOLD_SOURCE_HEAD) {
+    let released = false;
+    return (text) => {
+      if (released) return onChunk(text);
+      const normalized = normalizeMarkers(text);
+      // 标记出现 = 结构还在，放行；押满上限还没见到标记也放行，长段不能憋着不显示
+      if (markerMatches(normalized).next().done && stripMarkers(normalized).length < DRAFT_HOLD) return;
+      released = true;
+      onChunk(text);
+    };
+  }
+  return onChunk;
+}
+
 /**
  * 翻译一片；带标记的译文若丢了标记，点名重发一次（温度 0），两次里取丢得少的那份。
  * 只在出错时多花一次请求，正常情况零开销。
- * 补发不走流式回调：先保持完整首稿，采用补发结果时再替换。
+ * 补发不走流式回调：已经上屏的首稿保持显示（补发可能等 30 秒，不能让已读到的文字消失），
+ * 采用补发结果时再替换；被押住没上屏的首稿让页面停在加载动画，直接等补发结果。
  */
 async function translateOne(cfg, sub, onChunk, signal) {
-  const out = await request(cfg, sub, onChunk, signal);
+  let shown = false; // 首稿有没有真的上过屏：被押住的首稿没有
+  const out = await request(cfg, sub, gateDraft(sub, (text) => ((shown = true), onChunk(text))), signal);
   if (!sub.tagged || sub.repair) return out;
   const missing = missingTags(sub.text, out);
   if (!missing.length) return out;
-  // 流末尾若还在 25ms 合并窗口里会被 readStream 取消；补发可能等 30 秒，先确保完整首稿已经显示
-  onChunk(out);
+  // 已上屏的首稿要保住：流末尾若还在 25ms 合并窗口里会被 readStream 取消，
+  // 这里补发完整的一份，保证补发期间用户看到的是完整首稿而不是残缺的尾巴
+  if (shown) onChunk(out);
   let retry;
   try {
     retry = await request(cfg, { ...sub, repair: [...new Set(missing)] }, () => {}, signal);

@@ -722,20 +722,91 @@ test('补标记请求开始前先显示完整首稿', async () => {
   const isolated = loadBackground();
   isolated.events = [];
   isolated.read(`
-    request = async (_cfg, job) => {
+    request = async (_cfg, job, onChunk) => {
       events.push(job.repair ? 'repair-start' : 'initial-start');
-      return job.repair ? '<t1>译文</t1>' : '译文';
+      if (job.repair) return '<t1>译文</t1><x2/><b3>第二段</b3>';
+      const draft = '<t1>首稿</t1>第二段';
+      onChunk(draft.slice(0, 6)); // 流到一半，最后一段还在 25ms 合并窗口里
+      return draft;
     }
   `);
 
   const out = await isolated.translateOne(
     {},
-    { text: '<t1>source</t1>', tagged: true },
+    { text: '<t1>source</t1><x2/><b3>第二段</b3>', tagged: true },
     (text) => isolated.events.push(`show:${text}`)
   );
 
-  assert.deepEqual([...isolated.events], ['initial-start', 'show:译文', 'repair-start']);
+  // 首稿带 <t1>，结构被证实后照常上屏；流式没送到的结尾在补发前补齐
+  assert.deepEqual(
+    [...isolated.events],
+    ['initial-start', 'show:<t1>首稿', 'show:<t1>首稿</t1>第二段', 'repair-start']
+  );
+  assert.equal(out, '<t1>译文</t1><x2/><b3>第二段</b3>');
+});
+
+test('首稿丢光标记就不上屏，等补发结果直接以正确排版画出', async () => {
+  const isolated = loadBackground();
+  isolated.events = [];
+  isolated.read(`
+    request = async (_cfg, job, onChunk) => {
+      events.push(job.repair ? 'repair-start' : 'initial-start');
+      if (job.repair) return '<t1>译文</t1>';
+      const draft = '纯文本首稿';
+      onChunk(draft); // 流式照常产生，但押稿逻辑不该把它发给页面
+      return draft;
+    }
+  `);
+
+  const shown = [];
+  const out = await isolated.translateOne(
+    {},
+    { text: '<t1>source</t1>', tagged: true },
+    (text) => shown.push(text)
+  );
+
+  assert.deepEqual([...isolated.events], ['initial-start', 'repair-start'], '补发照常进行');
+  assert.deepEqual([...shown], [], '丢光标记的首稿不上屏，页面停在加载动画上');
   assert.equal(out, '<t1>译文</t1>');
+});
+
+/* ---------- 首稿押注：结构没被证实之前不上屏 ---------- */
+
+test('带标记的首稿：标记一出现就放行照常流式', () => {
+  const sent = [];
+  const gate = background.gateDraft({ tagged: true, text: '<t1>x</t1>' }, (text) => sent.push(text));
+  gate('开头几个字还没有');
+  assert.deepEqual([...sent], [], '没见到标记就先押住不上屏');
+  gate('开头几个字还没有 <t1>标记</t1> 出现');
+  assert.deepEqual([...sent], ['开头几个字还没有 <t1>标记</t1> 出现'], '标记一出现立刻放行');
+  gate('之后的分片照常透传');
+  assert.equal(sent.length, 2, '放行之后不再拦截');
+});
+
+test('押满上限就放弃押注，长段不能憋着不显示', () => {
+  const sent = [];
+  const hold = background.read('DRAFT_HOLD');
+  const gate = background.gateDraft({ tagged: true, text: '<t1>x</t1>' }, (text) => sent.push(text));
+  gate('甲'.repeat(hold - 1));
+  assert.deepEqual([...sent], []);
+  gate('甲'.repeat(hold)); // 分片是累计文本，可见长度到达上限
+  assert.deepEqual([...sent], ['甲'.repeat(hold)]);
+});
+
+test('原文开头没有结构的段落不押稿，照常流式', () => {
+  const sent = [];
+  // 首个标记埋在 300 个可见字符之后，押住只会白等
+  const source = '甲'.repeat(300) + '<t1>很深</t1>';
+  const gate = background.gateDraft({ tagged: true, text: source }, (text) => sent.push(text));
+  gate('译文开头多半也没有标记');
+  assert.deepEqual([...sent], ['译文开头多半也没有标记']);
+});
+
+test('不带标记的任务不押稿', () => {
+  const sent = [];
+  const gate = background.gateDraft({ tagged: false, text: 'plain' }, (text) => sent.push(text));
+  gate('随便什么文本');
+  assert.deepEqual([...sent], ['随便什么文本']);
 });
 
 test('提示词版本号参与缓存键，改了提示词旧译文要作废', () => {
