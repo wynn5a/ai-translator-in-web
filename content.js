@@ -162,7 +162,9 @@ const DOTS_CSS = `
 const PAGE_CSS = `${DOTS_CSS}
 [data-ai-tr-hover]{outline:2px solid rgba(47,111,237,.55)!important;outline-offset:2px!important;
   border-radius:3px;transition:outline-color .12s}
-.ai-tr-retry{all:unset;cursor:pointer;text-decoration:underline;font:inherit}`;
+.ai-tr-retry{all:unset;cursor:pointer;text-decoration:underline;font:inherit}
+/* 译文与原文唯一的视觉区分：轻微降不透明度。不用改颜色——浅色/深色主题下都成立 */
+[data-ai-translation]{opacity:.85}`;
 
 let pageStyled = false;
 function injectPageCss() {
@@ -726,6 +728,7 @@ function createTarget(block) {
 
 function blockError(block, target, error, code) {
   target.style.color = '#c62828';
+  target.style.opacity = '1'; // 错误提示不是译文，不跟着降不透明度
   const msg = document.createElement('span');
   msg.textContent = `${error} `;
   const retry = document.createElement('button');
