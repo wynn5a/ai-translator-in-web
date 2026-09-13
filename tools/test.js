@@ -289,6 +289,23 @@ test('查词的提示词同样静态 system + 参考资料 user', () => {
   );
 });
 
+test('语言约束在 system 里三处点名，正文前再锚定一次', () => {
+  const { messages } = promptOf({ kind: 'block', text: 'x' });
+  const sys = messages[0].content;
+  const user = messages[1].content;
+  assert.ok(sys.includes('母语是简体中文'), '角色行说明母语');
+  assert.ok(sys.includes('译文只能是简体中文'), '规则里点名目标语言');
+  assert.ok((sys.match(/简体中文/g) || []).length >= 3, 'system 至少三处点名');
+  assert.ok(sys.includes('无论原文是什么语言'), '堵住「原文语言就是输出语言」的口子');
+  assert.ok(user.includes('【待译正文】用简体中文翻译：'), '紧挨正文再锚定一次');
+  assert.ok(
+    promptOf({ kind: 'block', text: 'x', part: [2, 3] }).messages[1].content.includes(
+      '第 2/3 部分，只翻译发给你的这部分，用简体中文翻译：'
+    ),
+    '分片标签同样带着目标语言'
+  );
+});
+
 test('模型把提示词或参考资料照抄出来时不当译文显示', () => {
   const { stripEcho } = background;
   const { messages, echo } = promptOf({ kind: 'block', text: 'x', page: { site: 'unfair.so', title: 'Pay less' } });
@@ -325,6 +342,32 @@ test('标记完整性检查：漏掉的标记被点名，写歪的不算漏', ()
   assert.deepEqual(missingTags(src, '点 <t1>这里</t1> 运行 <x2/>\n<b3>第二段</b3>'), ['<n/>']);
   assert.deepEqual(missingTags('A。<n1/>\n<n2/>\nB。', 'A。<n7/><n8/>B。'), [], '换行标记只数个数');
   assert.deepEqual(missingTags('用 <t1>List</t1>', '用 List<T1>'), ['<t1>', '</t1>'], '大写泛型不是标记');
+});
+
+test('语言漂移检查：目标中文而译文没有汉字、或混入假名谚文才算漂', () => {
+  const drifted = background.read('drifted');
+  const en = 'The quick brown fox jumps over the lazy dog.';
+  assert.ok(drifted('简体中文', en, en), '整段照抄原文必漂');
+  assert.ok(!drifted('简体中文', en, '敏捷的棕色狐狸跳过了懒狗。'), '有汉字就算译过');
+  assert.ok(drifted('简体中文', 'hello world foo bar', 'こんにちは'), '假名必漂');
+  assert.ok(drifted('简体中文', 'hello world foo bar', '안녕하세요'), '谚文必漂');
+  assert.ok(!drifted('English', en, en), '只对中文目标验收，其他语言不下判断');
+  assert.ok(!drifted('简体中文', 'npm install', 'npm install'), '不足三个外语词不判漂，专有名词原样返回是合法的');
+  assert.ok(
+    drifted('简体中文', 'Use <t1>npm install</t1> to set up the project.', 'Use npm install to set up the project.'),
+    '标记里的代码也算进原文词数，标记外的外语词句没译就该重发'
+  );
+});
+
+test('语言纠正的重发提示词钉住目标语言，且温度为 0', () => {
+  const job = { kind: 'block', text: 'x', langFix: true };
+  const { messages, echo } = promptOf(job);
+  const user = messages[1].content;
+  assert.ok(user.includes('【语言纠正】上一次的输出不是简体中文'));
+  assert.ok(user.endsWith('维持原样。'), '语言纠正指令放在正文之后');
+  assert.ok(echo.includes('【语言纠正】'), '纠正指令参与回声指纹，被照抄时截断');
+  assert.ok(!promptOf({ kind: 'block', text: 'x' }).messages[1].content.includes('上一次'), '正常请求不带纠正指令');
+  assert.equal(background.read('temperatureOf')(job), 0);
 });
 
 test('术语收集沿用翻译开始时的配置上下文', async () => {
@@ -948,6 +991,71 @@ test('首稿丢光标记就不上屏，等补发结果直接以正确排版画�
   assert.deepEqual([...isolated.events], ['initial-start', 'repair-start'], '补发照常进行');
   assert.deepEqual([...shown], [], '丢光标记的首稿不上屏，页面停在加载动画上');
   assert.equal(out, '<t1>译文</t1>');
+});
+
+test('译文跑成英文时点名重发，通过检查的那份才算数', async () => {
+  const isolated = loadBackground();
+  isolated.events = [];
+  isolated.read(`
+    request = async (_cfg, job) => {
+      events.push(job.langFix ? 'langfix-start' : 'initial-start');
+      if (job.langFix) return '重发后的中文译文。';
+      return 'The quick brown fox jumps over the lazy dog.';
+    }
+  `);
+
+  const out = await isolated.translateOne(
+    { targetLang: '简体中文' },
+    { kind: 'block', text: 'The quick brown fox jumps over the lazy dog.' },
+    () => {}
+  );
+
+  assert.deepEqual([...isolated.events], ['initial-start', 'langfix-start']);
+  assert.equal(out, '重发后的中文译文。');
+});
+
+test('重发仍跑偏就维持首稿，不无限重试', async () => {
+  const isolated = loadBackground();
+  isolated.events = [];
+  isolated.read(`
+    request = async (_cfg, job) => {
+      events.push(job.langFix ? 'langfix-start' : 'initial-start');
+      return 'Still all English words here.';
+    }
+  `);
+
+  const out = await isolated.translateOne(
+    { targetLang: '简体中文' },
+    { kind: 'block', text: 'Still all English words here.' },
+    () => {}
+  );
+
+  assert.deepEqual([...isolated.events], ['initial-start', 'langfix-start'], '只重发一次');
+  assert.equal(out, 'Still all English words here.', '两份都漂就用首稿，文字至少是完整的');
+});
+
+test('查词与已纠正过的任务不再触发语言重发', async () => {
+  const isolated = loadBackground();
+  isolated.events = [];
+  isolated.read(`
+    request = async (_cfg, job) => {
+      events.push(job.langFix ? 'fix-request' : 'plain-request');
+      return 'Kubernetes';
+    }
+  `);
+
+  await isolated.translateOne({ targetLang: '简体中文' }, { kind: 'term', text: 'Kubernetes' }, () => {});
+  await isolated.translateOne(
+    { targetLang: '简体中文' },
+    { kind: 'block', text: 'Kubernetes is a portable system.', langFix: true },
+    () => {}
+  );
+
+  assert.deepEqual(
+    [...isolated.events],
+    ['plain-request', 'fix-request'],
+    '查词允许专有名词原样返回；纠正重发是最后一轮，两个任务都各只发一次请求'
+  );
 });
 
 /* ---------- 首稿押注：结构没被证实之前不上屏 ---------- */

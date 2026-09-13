@@ -197,13 +197,18 @@ async function errorMessage(res) {
       正文外的每一行都带【前缀】参与回声指纹；正文本身绝不参与——模型把一句
       原文（专有名词、代码）原样留在译文里不该被误当成照抄提示词。 */
 
-const RULES = [
+/* 语言约束必须点名目标语言，并且把「该保留原文的记号」和「外语词句」分开说：
+   笼统的「已是目标语言的片段原样输出」会被模型放大成「保留原文的内容太多，
+   干脆整段照抄」——译文跑成原文语言多半从这里漏出去。 */
+const RULES = (lang) => [
   '忠实完整：不增不减、不改立场、不做总结、不加译者注。',
   '原样保留：数字、日期、时间、单位、货币、代码、命令、路径、文件名、变量名、URL、邮箱、@账号、#话题。',
   '专有名词（人名、公司、产品、框架、API）保留原文；已有公认译名的用译名。',
   '术语按该领域内的通行译法，不自造、不音译。',
   '保持原文的语域和语气：正式的别译成口语，口语的别译成书面语，营销文案保留其调性。',
-  '本来就是目标语言的片段原样输出。',
+  `译文只能是${lang}：原文里的外语句子和短语都必须译出来，无论原文是什么语言；` +
+    '只有上面列出的本该保留原文的内容维持原样。',
+  `原文已经是${lang}的片段原样输出，不要改写。`,
   '保持分段：原文的换行和空行原样保留，原文有几段就译成几段，不要合并成一段，也不要另起新段。',
 ];
 
@@ -231,7 +236,7 @@ const GLOSSARY_RULES = [
 ];
 
 // 提示词一改，旧译文就不该再拿出来用：这里 +1，缓存整体作废
-const PROMPT_VERSION = 7;
+const PROMPT_VERSION = 8;
 // 结果完整性规则改变时单独递增，避免继续命中旧版本可能截断的译文
 const CACHE_VERSION = 2;
 
@@ -240,7 +245,7 @@ const numbered = (list) => list.map((s, i) => `${i + 1}. ${s}`).join('\n');
 /** 已确定的译法：让同一个词在整站的每一段里都译成同一个样子 */
 const termsLine = (terms) =>
   terms?.length
-    ? `【术语表】以下译法在本站已经确定，原文出现时必须沿用，不要另译：\n${terms
+    ? `【术语表】以下译法在本站已经确定，只是参考资料、不要输出这份表本身；原文出现这些词时必须沿用，不要另译：\n${terms
         .map(([term, target]) => `${term} → ${target}`)
         .join('\n')}`
     : '';
@@ -290,6 +295,12 @@ const repairLine = (missing) =>
     ? `注意：上一次的译文丢失或改动了这些标记：${missing.join(' ')}。这次每个标记都必须原样出现，一个都不能少。`
     : '';
 
+/** 上一次输出整段跑成了别的语言：重发时在正文后面把语言要求单独钉一遍。
+    不举例——示范坏译文会教会模型输出坏译文。 */
+const LANG_FIX_LINE = (lang) =>
+  `【语言纠正】上一次的输出不是${lang}。把待译正文重新翻译一遍：整份译文必须是${lang}，` +
+  '只有本该保留原文的片段（代码、URL、数字、专有名词）维持原样。';
+
 /**
  * 组装一次请求。返回 messages 和 echo（回声指纹的取材范围）：
  * 参考资料被模型照抄出来时靠指纹整行截断，正文绝不入指纹。
@@ -338,24 +349,29 @@ function buildPrompt(job, lang) {
     };
   }
 
+  // 语言约束在三处重复点名（角色、规则、输出约束），user 的正文前再点一次：
+  // 译文跑成别的语言多发生在离正文远的指令被参考资料和原文稀释之后
+  const rules = RULES(lang);
   const system = join(
-    `你是资深译者，把用户给出的${kind === 'block' ? '网页正文' : '文字'}翻译成${lang}。`,
+    `你是资深译者，母语是${lang}，把用户给出的${kind === 'block' ? '网页正文' : '文字'}翻译成${lang}。`,
     kind === 'text' ? '这是用户在网页上选中的片段，可能不是完整句子。照原样翻译，不要补全、不要扩写。' : '',
-    `要求：\n${numbered(tagged ? [...RULES, TAG_RULE] : RULES)}`,
+    `要求：\n${numbered(tagged ? [...rules, TAG_RULE] : rules)}`,
     // 语言锚定放在 system 末位：user 里的参考资料和正文都可能是原文语言
-    `只输出${lang}译文本身：不要复述原文、不要加引号、不要任何说明或思考过程。`
+    `只输出${lang}译文本身：无论原文是什么语言，译文都只能是${lang}。` +
+      '不要复述原文、不要加引号、不要任何说明或思考过程。'
   );
 
   const bodyLabel = part
-    ? `【待译正文】这是长文的第 ${part[0]}/${part[1]} 部分，只翻译发给你的这部分：`
-    : '【待译正文】';
-  const repairNote = repairLine(repair); // 置于正文之后：最后一条指令，补标记要的是听话
+    ? `【待译正文】这是长文的第 ${part[0]}/${part[1]} 部分，只翻译发给你的这部分，用${lang}翻译：`
+    : `【待译正文】用${lang}翻译：`;
+  const langNote = job.langFix ? LANG_FIX_LINE(lang) : ''; // 置于正文之后：最后一条指令，纠正语言要的是听话
+  const repairNote = repairLine(repair);
   return {
     messages: [
       { role: 'system', content: system },
-      { role: 'user', content: join(reference, bodyLabel, text, repairNote) },
+      { role: 'user', content: join(reference, bodyLabel, text, langNote, repairNote) },
     ],
-    echo: join(system, reference, bodyLabel, repairNote),
+    echo: join(system, reference, bodyLabel, langNote, repairNote),
   };
 }
 
@@ -387,6 +403,22 @@ function missingTags(source, out) {
   const missing = [];
   for (const [tag, n] of want) for (let i = (got.get(tag) || 0); i < n; i++) missing.push(tag);
   return missing;
+}
+
+/* ---------- 语言漂移：译文整段跑成了别的语言 ---------- */
+
+/* 目标语言是中文时的验收口径：译文里出现假名或谚文必错；一个汉字都没有、
+   而原文又有三个以上拼音文字的词，多半是把翻译做成了照抄。
+   专有名词、代码整段保留的合法情形极少见——宁可白重发一次，不能让英文冒充译文。
+   只对中文目标下判断：其他目标语言没有同样便宜的判据，宁可放过。 */
+const HAN_CHAR = /[㐀-䶿一-鿿]/;
+const FOREIGN_WORD = /[A-Za-zÀ-ɏЀ-ӿͰ-Ͽ]{2,}/g;
+
+function drifted(targetLang, source, out) {
+  if (!/中文|汉语/.test(targetLang)) return false;
+  if (/[぀-ヿ]|[가-힯]/.test(out)) return true; // 中文译文里不会出现假名/谚文
+  if (HAN_CHAR.test(out)) return false;
+  return (stripMarkers(source).match(FOREIGN_WORD) || []).length >= 3;
 }
 
 /* ---------- 长段落分片：整段直发会漏译、后半段质量下滑，还可能撞输出上限 ---------- */
@@ -528,7 +560,7 @@ function gateDraft(sub, onChunk) {
 }
 
 /**
- * 翻译一片；带标记的译文若丢了标记，点名重发一次（温度 0），两次里取丢得少的那份。
+ * 翻译一片；译文跑成别的语言或带标记的译文丢了标记时，点名重发一次（温度 0）。
  * 只在出错时多花一次请求，正常情况零开销。
  * 补发不走流式回调：已经上屏的首稿保持显示（补发可能等 30 秒，不能让已读到的文字消失），
  * 采用补发结果时再替换；被押住没上屏的首稿让页面停在加载动画，直接等补发结果。
@@ -536,20 +568,40 @@ function gateDraft(sub, onChunk) {
 async function translateOne(cfg, sub, onChunk, signal) {
   let shown = false; // 首稿有没有真的上过屏：被押住的首稿没有
   const out = await request(cfg, sub, gateDraft(sub, (text) => ((shown = true), onChunk(text))), signal);
-  if (!sub.tagged || sub.repair) return out;
-  const missing = missingTags(sub.text, out);
-  if (!missing.length) return out;
+  // 语言漂移先于标记检查：语言错了的译文不值得为它修标记。
+  // 只查正文两类：查词允许专有名词原样返回，没有「整段」可查；已经修过语言的不再重修
+  let settled = out;
+  if (
+    (sub.kind === 'text' || sub.kind === 'block') &&
+    !sub.langFix &&
+    !sub.repair &&
+    drifted(cfg.targetLang, sub.text, out)
+  ) {
+    if (shown) onChunk(out);
+    try {
+      const retry = await request(cfg, { ...sub, langFix: true }, () => {}, signal);
+      if (!drifted(cfg.targetLang, sub.text, retry)) {
+        settled = retry;
+        shown = false; // 押住首稿的页面直接等这份，不再有旧首稿可放行
+      }
+    } catch (e) {
+      if (signal?.aborted) throw e;
+    }
+  }
+  if (!sub.tagged || sub.repair) return settled;
+  const missing = missingTags(sub.text, settled);
+  if (!missing.length) return settled;
   // 已上屏的首稿要保住：流末尾若还在 25ms 合并窗口里会被 readStream 取消，
   // 这里补发完整的一份，保证补发期间用户看到的是完整首稿而不是残缺的尾巴
-  if (shown) onChunk(out);
+  if (shown) onChunk(settled);
   let retry;
   try {
     retry = await request(cfg, { ...sub, repair: [...new Set(missing)] }, () => {}, signal);
   } catch (e) {
     if (signal?.aborted) throw e;
-    return out; // 重发失败就用第一份：文字是完整的，只是丢了结构
+    return settled; // 重发失败就用第一份：文字是完整的，只是丢了结构
   }
-  return missingTags(sub.text, retry).length < missing.length ? retry : out;
+  return missingTags(sub.text, retry).length < missing.length ? retry : settled;
 }
 
 /* ---------- 主流程 ---------- */
@@ -691,7 +743,7 @@ async function extractTerms(cfg, scope, source, target, signal) {
 
 /* 查词和抽术语要唯一解，段落要通顺，所以温度分档 */
 const TEMPERATURE = { term: 0, text: 0.2, block: 0.3, glossary: 0 };
-const temperatureOf = (job) => (job.repair ? 0 : TEMPERATURE[job.kind] ?? 0.2); // 补标记要的是听话，不是通顺
+const temperatureOf = (job) => (job.repair || job.langFix ? 0 : TEMPERATURE[job.kind] ?? 0.2); // 纠错要的是听话，不是通顺
 
 /** 防止长段落被端点的默认输出上限截断；o 系 / gpt-5 换了字段名 */
 const MAX_OUTPUT_TOKENS = 4096;
