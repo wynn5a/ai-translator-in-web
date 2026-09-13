@@ -273,6 +273,83 @@ test('译文交付后取消时不再把尚未完成的术语写入表中', async
   assert.equal((await isolated.getGlossary()).size, 0);
 });
 
+/* ---------- 语种判断 ---------- */
+
+/** 给内容脚本配上一个 CLD 桩，并记录调用次数 */
+function loadDetector(cld) {
+  const isolated = loadContent();
+  let calls = 0;
+  isolated.chrome.i18n = {
+    detectLanguage: async () => (calls++, cld()),
+  };
+  return { ctx: isolated, called: () => calls };
+}
+
+test('日/韩/中/俄按文字系统直接判定，不询问 CLD', async () => {
+  const { ctx, called } = loadDetector(() => {
+    throw new Error('不应询问 CLD');
+  });
+  assert.equal(await ctx.detectLang('こんにちは、世界です。'), 'ja');
+  assert.equal(await ctx.detectLang('안녕하세요 반갑습니다'), 'ko');
+  assert.equal(await ctx.detectLang('这是一段中文，用来判断语种。'), 'zh');
+  assert.equal(await ctx.detectLang('Это русский текст.'), 'ru');
+  assert.equal(called(), 0);
+});
+
+test('拉丁文字交给 CLD 细分，法语不再被当成英语', async () => {
+  const { ctx, called } = loadDetector(() => ({
+    languages: [
+      { language: 'fr-FR', percentage: 92 },
+      { language: 'en', percentage: 8 },
+    ],
+  }));
+  assert.equal(await ctx.detectLang('C’est une phrase française typique.'), 'fr', '地区码砍成主码');
+  assert.equal(called(), 1);
+});
+
+test('CLD 占比不过半（混合文本）时宁可翻译，不冒误跳过的险', async () => {
+  const { ctx } = loadDetector(() => ({
+    languages: [
+      { language: 'en', percentage: 40 },
+      { language: 'fr', percentage: 35 },
+      { language: 'de', percentage: 25 },
+    ],
+  }));
+  assert.equal(await ctx.detectLang('hello bonjour hallo'), '');
+});
+
+test('占比刻度是 0–1 的小数时按同一阈值算', async () => {
+  const { ctx } = loadDetector(() => ({
+    languages: [
+      { language: 'en', percentage: 0.96 },
+      { language: 'fr', percentage: 0.04 },
+    ],
+  }));
+  assert.equal(await ctx.detectLang('Just an ordinary English sentence.'), 'en');
+});
+
+test('CLD 不可用或报错时返回空：多翻一次好过误跳过', async () => {
+  const bare = loadContent(); // harness 的 chrome 桩没有 i18n
+  assert.equal(await bare.detectLang('Just an ordinary English sentence.'), '');
+  const broken = loadContent();
+  broken.chrome.i18n = {
+    detectLanguage: async () => {
+      throw new Error('boom');
+    },
+  };
+  assert.equal(await broken.detectLang('Just an ordinary English sentence.'), '');
+});
+
+test('只有语种与目标语言一致才跳过；法/德等目标语言也能命中', async () => {
+  const { ctx } = loadDetector(() => ({ languages: [{ language: 'fr', percentage: 100 }] }));
+  ctx.read('cfg.targetLang = "English"');
+  assert.equal(await ctx.alreadyTarget('C’est une phrase française.'), false, '法文不再被当成「已经是英语」');
+  ctx.read('cfg.targetLang = "Français"');
+  assert.equal(await ctx.alreadyTarget('C’est une phrase française.'), true);
+  ctx.read('cfg.targetLang = "简体中文"');
+  assert.equal(await ctx.alreadyTarget('这是一段中文。'), true, '中文走正则');
+});
+
 /* ---------- 缓存键 ---------- */
 
 const cacheCfg = {

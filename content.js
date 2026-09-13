@@ -101,12 +101,16 @@ function paragraphContext(block) {
 
 /* ---------- 语种判断：与目标语言一致才跳过 ---------- */
 
+/* 正则只认文字系统：日/韩/俄按字符集就足够准。拉丁字母是例外——
+   正则分不出英法德，若在里面给英语判型，法文德文全被当成英语，
+   目标语言是 English 时整段法译英会被误判成「已经是英语」跳过。
+   所以拉丁文字一律标成 latin，具体语种交给 chrome.i18n.detectLanguage。 */
 const SCRIPTS = [
   ['ja', /[぀-ヿ]/g, 0.05], // 假名出现即判为日语（日文含汉字）
   ['ko', /[가-힯]/g, 0.3],
   ['zh', /[㐀-䶿一-鿿]/g, 0.3],
   ['ru', /[Ѐ-ӿ]/g, 0.3],
-  ['en', /[A-Za-z]/g, 0.3],
+  ['latin', /[A-Za-zÀ-ɏ]/g, 0.3],
 ];
 
 const TARGETS = [
@@ -115,6 +119,11 @@ const TARGETS = [
   [/한국|韩语|korean/i, 'ko'],
   [/русск|俄语|russian/i, 'ru'],
   [/english|英语|英文/i, 'en'],
+  [/français|法语|法文|french/i, 'fr'],
+  [/deutsch|德语|德文|german/i, 'de'],
+  [/español|西班牙语|西班牙文|spanish/i, 'es'],
+  [/português|葡萄牙语|葡萄牙文|portuguese/i, 'pt'],
+  [/italiano|意大利语|意大利文|italian/i, 'it'],
 ];
 
 function detectScript(text) {
@@ -126,10 +135,27 @@ function detectScript(text) {
   return '';
 }
 
+/** 具体语种：非拉丁文字用上面的正则结果；拉丁文字问 CLD，取占比最高的一种，
+    砍掉地区码（zh-CN → zh）。占比的刻度有的实现是 0–100 有的是 0–1，按占比算不受影响；
+    占比不过半（混合文本、拿不准）和检测失败都返回空——
+    多翻一次没有害处，误判成「已经是目标语言」就真丢了一段译文。 */
+async function detectLang(text) {
+  const script = detectScript(text);
+  if (script !== 'latin') return script;
+  try {
+    const langs = (await chrome.i18n.detectLanguage(text.slice(0, 800))).languages || [];
+    const total = langs.reduce((sum, { percentage }) => sum + percentage, 0);
+    const top = langs.slice().sort((a, b) => b.percentage - a.percentage)[0];
+    return top && total && (top.percentage / total) * 100 >= 50 ? top.language.split('-')[0] : '';
+  } catch {
+    return '';
+  }
+}
+
 /** 只有识别出的语种与目标语言相同才跳过；目标语言无法识别时一律翻译 */
-function alreadyTarget(text) {
+async function alreadyTarget(text) {
   const target = TARGETS.find(([re]) => re.test(cfg.targetLang))?.[1];
-  return !!target && detectScript(text) === target;
+  return !!target && (await detectLang(text)) === target;
 }
 
 /** 从鼠标所在节点向上找到最近的、含足量文字的块级元素 */
@@ -378,12 +404,16 @@ function sentenceAround(range) {
 
 /* ---------- 发音：只给单词和短语，读原文 ---------- */
 
-// detectScript 认出的语种 → Google TTS 的 tl 参数
-const TTS_LANG = { zh: 'zh-CN', ja: 'ja', ko: 'ko', ru: 'ru', en: 'en' };
+// 检测出的语种 → Google TTS 的 tl 参数；表里没有的（fr、de…）直接用检测码
+const TTS_LANG = { zh: 'zh-CN' };
 const TTS_LIMIT = 200; // 与后台一致：端点对更长的文本直接报错
 
 /** 认不出语种（纯数字、符号）就不给按钮：读出来也不对 */
-const speakLang = (text) => (isTerm(text) && text.length <= TTS_LIMIT ? TTS_LANG[detectScript(text)] || '' : '');
+async function speakLang(text) {
+  if (!isTerm(text) || text.length > TTS_LIMIT) return '';
+  const code = await detectLang(text);
+  return TTS_LANG[code] || code;
+}
 
 // 喇叭：跟着 currentColor 走，深浅色主题都不用换图
 const SPEAKER_SVG =
@@ -524,8 +554,10 @@ async function runSelection(text, range, retryJob = null) {
       actions: errorActions(code, () => runSelection(text, range, job)),
     });
   }
-  // 只挂在最终译文上：流式过程中每个分片都会重建正文，按钮会一直闪
-  const lang = speakLang(text);
+  // 只挂在最终译文上：流式过程中每个分片都会重建正文，按钮会一直闪。
+  // 语种检测是异步的，回来后确认气泡还属于这个任务，别把喇叭按到新的译文上
+  const lang = await speakLang(text);
+  if (pending !== task) return;
   showTip(out, { inline: lang ? speakButton(text, lang) : null });
   // 译文到达后后台可能还在抽术语；保留句柄，让关闭气泡或发起新任务可以中止它。
   task.closed.then(() => {
@@ -866,11 +898,11 @@ function disarm() {
   highlight(null);
 }
 
-function trigger() {
+async function trigger() {
   const sel = activeSelection();
   if (sel) {
     const anchor = sel.range ? rangeAnchor(sel.range) : pointAnchor();
-    if (alreadyTarget(sel.text)) return flash(anchor, `已经是${cfg.targetLang}`);
+    if (await alreadyTarget(sel.text)) return flash(anchor, `已经是${cfg.targetLang}`);
     return runSelection(sel.text, sel.range);
   }
   const block = candidate();
@@ -879,7 +911,8 @@ function trigger() {
     if (hovered && !insideTip(hovered)) flash(pointAnchor(), '这里没找到可翻译的段落');
     return;
   }
-  if (alreadyTarget(block.innerText)) return flash(blockAnchor(block), `已经是${cfg.targetLang}`);
+  if (await alreadyTarget(block.innerText)) return flash(blockAnchor(block), `已经是${cfg.targetLang}`);
+  if (!block.isConnected) return; // 检测语种的空档里页面可能已经把段落换掉了
   runBlock(block, false);
 }
 
