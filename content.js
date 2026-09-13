@@ -163,8 +163,14 @@ const PAGE_CSS = `${DOTS_CSS}
 [data-ai-tr-hover]{outline:2px solid rgba(47,111,237,.55)!important;outline-offset:2px!important;
   border-radius:3px;transition:outline-color .12s}
 .ai-tr-retry{all:unset;cursor:pointer;text-decoration:underline;font:inherit}
+.ai-tr-retry:hover{opacity:.7}
+.ai-tr-retry:focus-visible{outline:1px solid currentColor;outline-offset:1px}
 /* 译文与原文唯一的视觉区分：轻微降不透明度。不用改颜色——浅色/深色主题下都成立 */
-[data-ai-translation]{opacity:.85}`;
+[data-ai-translation]{opacity:.85;animation:ai-tr-in .24s ease-out}
+/* 错误提示不是译文：不降不透明度，也不参与淡入——动画期间会盖住内联的 opacity:1，闪一下再变实 */
+[data-ai-translation].ai-tr-err{animation:none;opacity:1}
+@keyframes ai-tr-in{from{opacity:0}}
+@media (prefers-reduced-motion:reduce){[data-ai-translation]{animation:none}}`;
 
 let pageStyled = false;
 function injectPageCss() {
@@ -187,13 +193,20 @@ function dots() {
 
 const TIP_CSS = `
 .tip{position:fixed;box-sizing:border-box;width:max-content;max-width:min(380px,calc(100vw - 16px));
-  min-width:2em;padding:10px 12px;border-radius:10px;
+  /* 划选了几个段落时译文可能比视口还高：限高后在气泡里滚动，别让它伸出屏幕外够不着 */
+  max-height:calc(100vh - 24px);overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;
+  min-width:2em;padding:10px 12px;border-radius:10px;color-scheme:dark;
   font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-  color:#f5f5f5;background:#23252b;box-shadow:0 6px 24px rgba(0,0,0,.28);
+  color:#f5f5f5;background:#23252b;border:1px solid rgba(255,255,255,.1);
+  box-shadow:0 1px 2px rgba(0,0,0,.24),0 8px 28px rgba(0,0,0,.32);
+  animation:ai-tr-pop .16s ease-out;
   white-space:pre-wrap;word-break:break-word;user-select:text}
 @media (prefers-color-scheme:light){
-  .tip{color:#1c1e21;background:#fff;border:1px solid #e3e5e9;box-shadow:0 6px 24px rgba(0,0,0,.14)}}
+  .tip{color-scheme:light;color:#1c1e21;background:#fff;border-color:#e3e5e9;
+    box-shadow:0 1px 2px rgba(0,0,0,.1),0 8px 28px rgba(0,0,0,.14)}}
 .tip[hidden]{display:none}
+@keyframes ai-tr-pop{from{opacity:0;transform:scale(.96)}}
+@media (prefers-reduced-motion:reduce){.tip{animation:none}}
 .tip.err .body{color:#ff8a80}
 @media (prefers-color-scheme:light){.tip.err .body{color:#c4362c}}
 .tip.hint .body{opacity:.75;font-size:13px}
@@ -201,12 +214,14 @@ const TIP_CSS = `
 .bar[hidden]{display:none}
 .bar button{font:inherit;font-size:12px;line-height:1.4;padding:3px 10px;border-radius:6px;cursor:pointer;
   border:1px solid currentColor;background:transparent;color:inherit;opacity:.7}
-.bar button:hover{opacity:1}
+.bar button:hover{opacity:1;background:rgba(128,128,128,.16)}
+.bar button:focus-visible{opacity:1;outline:1px solid currentColor;outline-offset:2px}
 /* 发音按钮跟在译文末尾，和文字同一行，不占一整行 */
 .speak{display:inline-flex;vertical-align:-3px;margin-left:6px;padding:2px;line-height:0;
   border:0;border-radius:4px;background:transparent;color:inherit;opacity:.55;cursor:pointer;
   user-select:none} /* 气泡是 user-select:text，会继承进来：按在按钮上就等于在这里起一个新选区 */
 .speak:hover{opacity:1;background:rgba(128,128,128,.2)}
+.speak:focus-visible{opacity:1;outline:1px solid currentColor;outline-offset:1px}
 .speak:disabled{cursor:default;opacity:.3;background:transparent}
 .speak.bad{color:#ff8a80;opacity:1}
 @media (prefers-color-scheme:light){.speak.bad{color:#c4362c}}
@@ -729,6 +744,7 @@ function createTarget(block) {
 function blockError(block, target, error, code) {
   target.style.color = '#c62828';
   target.style.opacity = '1'; // 错误提示不是译文，不跟着降不透明度
+  target.classList.add('ai-tr-err'); // 关掉入场淡入，否则错误会先闪成半透明再变实
   const msg = document.createElement('span');
   msg.textContent = `${error} `;
   const retry = document.createElement('button');
