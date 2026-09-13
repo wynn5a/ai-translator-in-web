@@ -40,7 +40,33 @@ const pageBrief = () => ({
   site: location.hostname.replace(/^www\./, ''),
   title: tidy(document.title || metaContent('title'), 120),
   desc: tidy(metaContent('description'), 200),
+  outline: pageOutline(),
 });
+
+/* ---------- 页面大纲：全文的标题骨架 ----------
+
+   相邻段落只能看到目标段落身边的一小圈，模型对「这是全文的第几章、
+   前面讲过什么」没有概念。把整篇的标题层级一次性发给它，跨章节的
+   指代和术语就有得参照了。按 URL 缓存：大纲只在路由切换时才会变，
+   每次翻译都重新扫一遍标题太浪费。 */
+let outlineCache = { href: '', text: '' };
+
+function pageOutline() {
+  if (outlineCache.href === location.href) return outlineCache.text;
+  const lines = [];
+  let size = 0;
+  for (const h of document.querySelectorAll('h1,h2,h3,h4,h5,h6')) {
+    const style = getComputedStyle(h);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    const text = h.innerText?.replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    const line = `${'#'.repeat(+h.tagName[1])} ${text}`;
+    if ((size += line.length) > 500) break; // 截断在更深处：开头的标题本来就是最顶层的结构
+    lines.push(line);
+  }
+  outlineCache = { href: location.href, text: lines.join('\n') };
+  return outlineCache.text;
+}
 
 const CONTEXT_LIMIT = 300;
 const CONTEXT_LEVELS = 3;
