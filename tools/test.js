@@ -344,17 +344,16 @@ test('标记完整性检查：漏掉的标记被点名，写歪的不算漏', ()
   assert.deepEqual(missingTags('用 <t1>List</t1>', '用 List<T1>'), ['<t1>', '</t1>'], '大写泛型不是标记');
 });
 
-test('语言漂移检查：目标中文而译文没有汉字、或混入假名谚文才算漂', () => {
+test('语言漂移检查：译文没有汉字、或混入假名谚文才算漂（目标固定中文，不再看 targetLang）', () => {
   const drifted = background.read('drifted');
   const en = 'The quick brown fox jumps over the lazy dog.';
-  assert.ok(drifted('简体中文', en, en), '整段照抄原文必漂');
-  assert.ok(!drifted('简体中文', en, '敏捷的棕色狐狸跳过了懒狗。'), '有汉字就算译过');
-  assert.ok(drifted('简体中文', 'hello world foo bar', 'こんにちは'), '假名必漂');
-  assert.ok(drifted('简体中文', 'hello world foo bar', '안녕하세요'), '谚文必漂');
-  assert.ok(!drifted('English', en, en), '只对中文目标验收，其他语言不下判断');
-  assert.ok(!drifted('简体中文', 'npm install', 'npm install'), '不足三个外语词不判漂，专有名词原样返回是合法的');
+  assert.ok(drifted(en, en), '整段照抄原文必漂');
+  assert.ok(!drifted(en, '敏捷的棕色狐狸跳过了懒狗。'), '有汉字就算译过');
+  assert.ok(drifted('hello world foo bar', 'こんにちは'), '假名必漂');
+  assert.ok(drifted('hello world foo bar', '안녕하세요'), '谚文必漂');
+  assert.ok(!drifted('npm install', 'npm install'), '不足三个外语词不判漂，专有名词原样返回是合法的');
   assert.ok(
-    drifted('简体中文', 'Use <t1>npm install</t1> to set up the project.', 'Use npm install to set up the project.'),
+    drifted('Use <t1>npm install</t1> to set up the project.', 'Use npm install to set up the project.'),
     '标记里的代码也算进原文词数，标记外的外语词句没译就该重发'
   );
 });
@@ -380,7 +379,7 @@ test('术语收集沿用翻译开始时的配置上下文', async () => {
   };
   await background.harvest({ kind: 'term', text: 'shared module' }, result);
   const glossary = await background.getGlossary();
-  assert.equal(glossary.get(scope).get('shared module'), '共享模块');
+  assert.equal(glossary.get(scope).get('shared module').target, '共享模块');
   background.read('clearTimeout(glossaryTimer)');
 });
 
@@ -473,14 +472,15 @@ test('CLD 不可用或报错时返回空：多翻一次好过误跳过', async (
   assert.equal(await broken.detectLang('Just an ordinary English sentence.'), '');
 });
 
-test('只有语种与目标语言一致才跳过；法/德等目标语言也能命中', async () => {
-  const { ctx } = loadDetector(() => ({ languages: [{ language: 'fr', percentage: 100 }] }));
-  ctx.read('cfg.targetLang = "English"');
-  assert.equal(await ctx.alreadyTarget('C’est une phrase française.'), false, '法文不再被当成「已经是英语」');
-  ctx.read('cfg.targetLang = "Français"');
-  assert.equal(await ctx.alreadyTarget('C’est une phrase française.'), true);
-  ctx.read('cfg.targetLang = "简体中文"');
-  assert.equal(await ctx.alreadyTarget('这是一段中文。'), true, '中文走正则');
+/* 目标语言固定为中文：触发路径不再有异步检测，判定口径只看文字系统 */
+test('alreadyTarget 同步判定：中文跳过，日文（含汉字）/英文/俄文/混合一律不跳过', () => {
+  const ctx = loadContent();
+  assert.equal(ctx.alreadyTarget('这是一段中文，不用再翻译。'), true);
+  assert.equal(ctx.alreadyTarget('こんにちは、世界です。これは日本語です。'), false, '假名优先判定，含汉字也不误跳');
+  assert.equal(ctx.alreadyTarget('The quick brown fox jumps over the lazy dog.'), false);
+  assert.equal(ctx.alreadyTarget('Это русский текст.'), false);
+  assert.equal(ctx.alreadyTarget('123 + 456 = 579'), false, '拿不准宁多翻不误跳');
+  assert.equal(ctx.alreadyTarget('hello bonjour hallo'), false, '拉丁文字永远不是中文');
 });
 
 /* ---------- 缓存键 ---------- */
@@ -553,7 +553,7 @@ test('相关术语更新后不命中旧译文缓存', async () => {
   isolated.requests = [];
   isolated.read(`
     cache = new Map();
-    glossary = new Map([['example.com\\x01简体中文', new Map([['paragraph', '段落']])]]);
+    glossary = new Map([['example.com\\x01简体中文', new Map([['paragraph', { target: '段落', hits: 1 }]])]]);
     loadConfig = async () => ({ active: testCfg });
     request = async (_cfg, job) => {
       requests.push(job.terms);
@@ -566,8 +566,11 @@ test('相关术语更新后不命中旧译文缓存', async () => {
   assert.equal((await isolated.translateWithContext(job)).text, '首稿', '术语未变时应命中缓存');
   await isolated.remember('example.com\x01简体中文', 'unrelated', '无关');
   assert.equal((await isolated.translateWithContext(job)).text, '首稿', '无关术语不应让缓存失效');
+  // 异议译法只记一次不动摇原译法（错误译法不能一次就污染整站），追平后才生效
   await isolated.remember('example.com\x01简体中文', 'paragraph', '段');
-  assert.equal((await isolated.translateWithContext(job)).text, '新译文', '术语变化后必须重新翻译');
+  assert.equal((await isolated.translateWithContext(job)).text, '首稿', '一次异议不足以推翻原译法');
+  await isolated.remember('example.com\x01简体中文', 'paragraph', '段');
+  assert.equal((await isolated.translateWithContext(job)).text, '新译文', '译法改变后必须重新翻译');
   assert.deepEqual(
     [...isolated.requests].map((terms) => [...terms].map((term) => [...term])),
     [
@@ -911,7 +914,8 @@ test('并发冷启动只读取一次并共享同一份术语表', async () => {
   load.resolve({ __glossary: [['example.com\x01简体中文', [['term', '术语']]]] });
   const [a, b] = await Promise.all([first, second]);
   assert.equal(a, b);
-  assert.equal(a.get('example.com\x01简体中文').get('term'), '术语');
+  // 旧格式读出来统一成 { target, hits }：译文取 target，hits 从 1 起算
+  assert.equal(a.get('example.com\x01简体中文').get('term').target, '术语');
 });
 
 test('清空操作不会被尚未完成的冷启动读取回填', async () => {
@@ -1101,4 +1105,344 @@ test('提示词版本号参与缓存键，改了提示词旧译文要作废', ()
   assert.ok(Number.isInteger(background.read('PROMPT_VERSION')));
   assert.ok(Number.isInteger(background.read('CACHE_VERSION')));
   assert.ok(/PROMPT_VERSION,/.test(require('node:fs').readFileSync(`${__dirname}/../background.js`, 'utf8')));
+});
+
+/* ---------- 提示词按任务类型裁剪 ---------- */
+
+test('查词只带站点：义项判断不需要整页背景，也不该被术语表锚死', () => {
+  const { messages } = promptOf({
+    kind: 'term',
+    text: 'bank',
+    context: 'The river bank was muddy.',
+    page: { site: 'example.com', title: 'Guide', desc: 'docs', outline: '## Install' },
+    terms: [['bank', '岸']],
+  });
+  const user = messages[1].content;
+  assert.ok(user.includes('【来源】example.com'));
+  for (const 不该有 of ['Guide', '【页面简介】', '【本文大纲】', '【术语表】', '【最近标题】'])
+    assert.ok(!user.includes(不该有), `查词不该带「${不该有}」`);
+});
+
+test('划词带页面背景与术语，不带大纲和相邻段落', () => {
+  const { messages } = promptOf({
+    kind: 'text',
+    text: 'A selected sentence.',
+    page: { site: 'example.com', title: 'Guide', desc: 'docs', outline: '## Install' },
+    surrounding: { heading: 'Architecture', before: 'Before text.', after: 'After text.' },
+    terms: [['river bank', '河岸']],
+  });
+  const user = messages[1].content;
+  assert.ok(user.includes('【来源】example.com 的页面《Guide》'));
+  assert.ok(user.includes('【术语表】'));
+  for (const 不该有 of ['【本文大纲】', '【最近标题】', 'Before text.'])
+    assert.ok(!user.includes(不该有), `划词不该带「${不该有}」`);
+});
+
+test('段落翻译仍保留全部参考资料；长大纲只留一级标题和当前所在的二级', () => {
+  const outline = ['# Top', '## A', '### A1', '### A2', '## B', '### B1', '### B2', '## C', '### C1', '### C2'].join('\n');
+  const { messages } = promptOf({
+    kind: 'block',
+    text: 'Target paragraph.',
+    page: { site: 'example.com', outline },
+    surrounding: { heading: 'A2' },
+  });
+  const user = messages[1].content;
+  assert.ok(user.includes('【本文大纲】\n# Top\n## A'), '只留一级和当前所在二级，其余标题截掉');
+  assert.ok(!user.includes('### A1'), '三级标题整层去掉');
+  assert.ok(user.includes('【最近标题】'), '相邻段落只有段落翻译才有');
+  // 大纲不足 8 行的小页面原样保留
+  const small = promptOf({
+    kind: 'block',
+    text: 'x',
+    page: { site: 'example.com', outline: '## Install\n## Usage' },
+  }).messages[1].content;
+  assert.ok(small.includes('## Install') && small.includes('## Usage'));
+});
+
+test('并行分片带相邻分片原文，串行分片带前文衔接，两者不混用', () => {
+  const parallel = promptOf({ kind: 'block', text: 'x', neighbors: { prev: '前片结尾。', next: '后片开头。' } });
+  assert.ok(parallel.messages[1].content.includes('【相邻分片】'));
+  assert.ok(parallel.messages[1].content.includes('前片结尾。'));
+  assert.ok(!parallel.messages[1].content.includes('【前文衔接】'));
+  const serial = promptOf({ kind: 'block', text: 'x', carry: '前文结尾' });
+  assert.ok(serial.messages[1].content.includes('【前文衔接】'));
+  assert.ok(!serial.messages[1].content.includes('【相邻分片】'));
+});
+
+test('成稿通读的提示词：原稿 + 初稿一起给，输出约束留在末位', () => {
+  const job = { kind: 'polish', text: '原稿全文。', context: '初稿全文。' };
+  const { messages, echo } = promptOf(job);
+  assert.ok(messages[0].content.includes('译文初稿'), '角色行说明这是校对任务');
+  assert.ok(messages[1].content.includes('【原文】') && messages[1].content.includes('【译文初稿】'));
+  assert.ok(messages[1].content.trimEnd().endsWith('初稿全文。'));
+  assert.ok(echo.includes('【原文】'), '校对输入参与回声指纹');
+  assert.equal(background.read('temperatureOf')(job), 0.2);
+  assert.equal(background.read('temperatureOf')({ kind: 'block', omitFix: ['3'] }), 0, '漏译重发也是温度 0');
+});
+
+/* ---------- 漏译验收 ---------- */
+
+test('漏译验收：数字缺失触发重发，数字齐全的好译文不触发', () => {
+  const omissions = (s, o) => [...background.omissions(s, o)]; // vm 里的数组不是本境的 Array
+  const score = background.read('omissionScore');
+  const src = '2024 年发布了 3 个版本，共 1,024 次下载，环比增长 42.5%。';
+  assert.deepEqual(omissions(src, '2024 年发布了 3 个版本，共 1,024 次下载，环比增长 42.5%。'), []);
+  assert.deepEqual(omissions(src, '2024 年发布了 3 个版本，下载量 1024 次。'), ['42.5'], '千分位归一后仍要齐全');
+  assert.ok(score(src, '今年发布了几个版本。') > 0, '数字缺失要立案');
+  assert.equal(score(src, '2024 年发布了 3 个版本，共 1,024 次下载，环比增长 42.5%。'), 0);
+  assert.equal(omissions('No numbers here.', '没有数字。').length, 0, '源文没有数字就不查数字');
+});
+
+test('长度比对按内容单位算，好译文不因中英文长差被误判', () => {
+  const score = background.read('omissionScore');
+  const en = 'The quick brown fox jumps over the lazy dog. '.repeat(3);
+  assert.equal(score(en, '敏捷的棕色狐狸跳过了懒狗。 '.repeat(3)), 0, '正常英文→中文不误报');
+  assert.ok(
+    score(en.repeat(3), '敏捷的棕色狐狸跳过了懒狗。') > 0,
+    '只译出前三分之一就是漏了整句'
+  );
+});
+
+test('漏译重发走单次通道，重发更好才替换，不阻塞首稿上屏', async () => {
+  const isolated = loadBackground();
+  isolated.events = [];
+  isolated.read(`
+    request = async (_cfg, job, onChunk) => {
+      events.push(job.omitFix ? 'omit-fix' : 'initial-start');
+      if (job.omitFix) return '完整译文：2024 年 3 个版本，增长 42.5%。';
+      onChunk('译文。'); // 首稿照常流式上屏
+      return '译文。';
+    }
+  `);
+  const shown = [];
+  const out = await isolated.translateOne(
+    { targetLang: '简体中文' },
+    { kind: 'text', text: 'In 2024 we shipped 3 releases, up 42.5%.' },
+    (t) => shown.push(t)
+  );
+  assert.deepEqual([...isolated.events], ['initial-start', 'omit-fix'], '只重发一次');
+  assert.deepEqual([...new Set(shown)], ['译文。'], '首稿先上屏，补发不走流式回调');
+  assert.equal(out, '完整译文：2024 年 3 个版本，增长 42.5%。');
+});
+
+test('重发仍有漏译就维持首稿', async () => {
+  const isolated = loadBackground();
+  isolated.read(`
+    request = async () => '还是短。';
+  `);
+  const out = await isolated.translateOne(
+    { targetLang: '简体中文' },
+    { kind: 'text', text: 'In 2024 we shipped 3 releases, up 42.5%.' },
+    () => {}
+  );
+  assert.equal(out, '还是短。', '两份都不完整就保留首稿，不再重试');
+});
+
+/* ---------- 分片并行调度 ---------- */
+
+test('分片并行：并发不超过上限、上屏顺序与原文一致、进度递增', async () => {
+  const isolated = loadBackground();
+  isolated.read(`
+    var active = 0, maxActive = 0;
+    var gates = [0, 1, 2, 3, 4].map(() => {
+      let open;
+      const promise = new Promise((r) => (open = r));
+      return { promise, open };
+    });
+    translateOne = async (cfg, sub) => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await gates[sub.part[0] - 1].promise;
+      active--;
+      return '译' + sub.part[0];
+    };
+  `);
+  const chunks = [1, 2, 3, 4, 5].map((i) => ({ text: `第${i}片`, sep: '\n' }));
+  const frames = [];
+  const progress = [];
+  const done = isolated.translateChunks(
+    { parallel: true },
+    { kind: 'block', scope: '' },
+    chunks,
+    (t) => frames.push(t),
+    undefined,
+    (label, running) => progress.push([label, running])
+  );
+
+  await new Promise((r) => setTimeout(r, 0));
+  for (const i of [3, 0, 4, 1, 2]) {
+    isolated.read(`gates[${i}].open()`); // 乱序完成
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  const final = await done;
+
+  assert.equal(final, '译1\n译2\n译3\n译4\n译5');
+  assert.ok(isolated.read('maxActive') <= 3, '并发不超过 CHUNK_CONCURRENT');
+  for (const f of frames) assert.ok(final.startsWith(f), `上屏帧「${f}」偏离了原文顺序`);
+  assert.equal(frames[0], '译1\n', '先完成的分片也不能越过前面的分片先画');
+  assert.deepEqual(progress[0], ['0/5', true], '一开工就报总片数');
+  assert.deepEqual(progress[progress.length - 1], ['5/5', false], '译完即收进度');
+});
+
+test('某片失败：其余分片照常上屏，整体照样报错', async () => {
+  const isolated = loadBackground();
+  isolated.read(`
+    translateOne = async (cfg, sub) => {
+      if (sub.part[0] === 2) throw Object.assign(new Error('分片坏了'), { code: 'http-500' });
+      return '译' + sub.part[0];
+    };
+  `);
+  const chunks = [1, 2, 3].map((i) => ({ text: `第${i}片`, sep: '\n' }));
+  const frames = [];
+  await assert.rejects(
+    isolated.translateChunks(
+      { parallel: true },
+      { kind: 'block', scope: '' },
+      chunks,
+      (t) => frames.push(t),
+      undefined,
+      null
+    ),
+    /分片坏了/
+  );
+  assert.deepEqual(frames, ['译1\n'], '失败片之前的分片已经上屏，文字不丢');
+});
+
+test('「连贯优先」关闭并行，退回串行衔接', async () => {
+  const isolated = loadBackground();
+  isolated.read(`
+    var parts = [];
+    translateOne = async (cfg, sub) => {
+      parts.push(sub.part[0]);
+      return '串行' + sub.part[0];
+    };
+  `);
+  const chunks = [1, 2, 3].map((i) => ({ text: `第${i}片`, sep: '\n' }));
+  const out = await isolated.translateChunks(
+    { parallel: false },
+    { kind: 'block', scope: '' },
+    chunks,
+    () => {},
+    undefined,
+    null
+  );
+  assert.deepEqual([...isolated.read('parts')], [1, 2, 3], '串行按序发');
+  assert.equal(out, '串行1\n串行2\n串行3');
+});
+
+test('分片进度走旁路消息，不进流式文本通道', async () => {
+  const isolated = loadContent();
+  const channel = fakePort();
+  isolated.chrome.runtime.connect = () => channel.port;
+  isolated.cancelAnimationFrame = () => {};
+  const painted = [];
+  const progress = [];
+  const task = isolated.requestTranslation({ kind: 'text', text: 'x' }, (t) => painted.push(t), (p) => progress.push(p));
+  channel.receive({ progress: '1/2' });
+  channel.receive({ chunk: '文本' });
+  channel.drop();
+  await task;
+  assert.deepEqual(progress, ['1/2']);
+  assert.deepEqual(painted, [], '进度消息不触发正文重绘');
+});
+
+/* ---------- 强制重译 / 超时 / 术语表冲突 ---------- */
+
+test('force 时缓存命中也发请求，成功后覆写缓存', async () => {
+  const isolated = loadBackground();
+  isolated.testCfg = { ...cacheCfg };
+  isolated.read('cache = new Map(); glossary = new Map(); loadConfig = async () => ({ active: testCfg, parallel: true });');
+  let n = 0;
+  isolated.fetch = async () => jsonResponse(`第${++n}版译文`, 'stop');
+  const job = { kind: 'text', text: 'hello world foo bar baz' };
+
+  assert.equal((await isolated.translateWithContext(job)).text, '第1版译文');
+  assert.equal((await isolated.translateWithContext(job)).text, '第1版译文', '正常路径命中缓存');
+  assert.equal((await isolated.translateWithContext({ ...job, force: true })).text, '第2版译文', 'force 绕过缓存');
+  assert.equal((await isolated.translateWithContext(job)).text, '第2版译文', '重译成功后覆写缓存条目');
+});
+
+test('缓存键包含分片串行/并行的模式', () => {
+  const key = background.cacheKeyFor(cacheCfg, cacheJob);
+  assert.notEqual(background.cacheKeyFor({ ...cacheCfg, parallel: false }, cacheJob), key);
+});
+
+test('超时上限：本地端点自动放宽，profile 配置优先生效', () => {
+  const timeoutFor = background.read('timeoutFor');
+  assert.equal(timeoutFor({ baseUrl: 'https://api.example.com/v1' }), 30000);
+  assert.equal(timeoutFor({ baseUrl: 'http://localhost:11434/v1' }), 120000, '本地模型首字节经常超 30s');
+  assert.equal(timeoutFor({ baseUrl: 'https://127.0.0.1:8080/v1' }), 120000);
+  assert.equal(timeoutFor({ baseUrl: 'http://ollama.internal/v1' }), 120000);
+  assert.equal(timeoutFor({ baseUrl: 'https://api.example.com/v1', timeout: '45' }), 45000, '配置值优先');
+  assert.equal(timeoutFor({ baseUrl: 'http://localhost:11434/v1', timeout: '300' }), 300000);
+  assert.equal(timeoutFor({ baseUrl: 'https://api.example.com/v1', timeout: 'abc' }), 30000, '非法配置走默认');
+});
+
+test('同词异译保留高频侧，首次记录不受影响', async () => {
+  const isolated = loadBackground();
+  const scope = 'example.com\x01简体中文';
+  await isolated.remember(scope, 'pitch', '投球');
+  assert.equal((await isolated.glossaryFor(scope, 'the pitch here'))[0][1], '投球', '首次记录立即生效');
+
+  await isolated.remember(scope, 'pitch', '投球'); // 同译法 → hits 2
+  await isolated.remember(scope, 'pitch', '音高'); // 异译但计数少 → 保留原译法
+  assert.equal((await isolated.glossaryFor(scope, 'the pitch here'))[0][1], '投球', '一次误译不能污染整站');
+
+  await isolated.remember(scope, 'pitch', '音高'); // 追平到 2
+  await isolated.remember(scope, 'pitch', '音高'); // 3 > 2 → 换新译法
+  assert.equal((await isolated.glossaryFor(scope, 'the pitch here'))[0][1], '音高', '高频侧最终胜出');
+  isolated.read('clearTimeout(saveTimer); clearTimeout(glossaryTimer)');
+});
+
+/* ---------- 成稿通读 ---------- */
+
+test('成稿通读默认关闭；开启时初稿先交付、校对结果替换', async () => {
+  const make = (polish) => {
+    const isolated = loadBackground();
+    isolated.testCfg = { ...cacheCfg, polish };
+    isolated.read(`
+      cache = new Map(); glossary = new Map();
+      loadConfig = async () => ({ active: testCfg, parallel: true });
+      var reqKinds = [];
+      request = async (cfg, job) => {
+        reqKinds.push(job.kind);
+        // 初稿和校对稿都要「够长」：漏译验收按内容单位比，太短的桩会被当成漏译触发重发
+        return job.kind === 'polish'
+          ? '校对后的全文，指代与术语都顺了。'.repeat(30)
+          : '初稿片段，足够长，不会误报漏译。'.repeat(30);
+      };
+    `);
+    return isolated;
+  };
+
+  const source = '这是一句话。'.repeat(250); // 1500 字 → 触发分片
+  const job = { kind: 'block', text: source };
+
+  const off = make(false);
+  const frames = [];
+  const offOut = (await off.translateWithContext(job, (t) => frames.push(t))).text;
+  assert.ok(offOut.includes('初稿片段'), '默认关：交付的就是分片初稿');
+  assert.deepEqual([...off.read('reqKinds')], ['block', 'block'], '默认关：只发分片请求');
+  assert.ok(frames.length >= 2, '初稿照常流式上屏');
+
+  const on = make(true);
+  const result = await on.translateWithContext(job);
+  assert.deepEqual([...on.read('reqKinds')], ['block', 'block', 'polish'], '开启时在分片之后追加校对');
+  assert.ok(result.text.startsWith('校对后的全文'), '初稿已交付，校对结果替换');
+});
+
+/* ---------- 查词的句子边界 ---------- */
+
+test('缩写和小数不切断「所在句」', () => {
+  const ctx = loadContent();
+  const { prevSentenceEnd, nextSentenceEnd } = ctx;
+
+  assert.equal(nextSentenceEnd('Values, e.g. Numbers here. End.'), 25, 'e.g. 之后的句点被否决');
+  assert.equal(nextSentenceEnd('Version 1.2. Use it.'), 11, '小数点后的 1.2. 是句子结尾（下一句大写开头）');
+  assert.equal(nextSentenceEnd('v1.2. next part'), -1, '小写开头的「下一句」被否决');
+  assert.equal(nextSentenceEnd('This is fine. Next.'), 12, '正常句末照常判定');
+  assert.equal(nextSentenceEnd('First part; second. Next.'), 18, '分号不算下一句的句尾');
+  assert.equal(prevSentenceEnd('One. Two. Sel'), 9, '前面的句尾从后往前找');
+  assert.equal(prevSentenceEnd('a; b. sel'), 2, '分号也是上一句的边界');
+  assert.equal(prevSentenceEnd('see e.g. the doc'), 0, 'e.g. 之前没有真正的句尾');
 });

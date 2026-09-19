@@ -4,7 +4,15 @@ const MAX_CONCURRENT = 10;
 const CACHE_KEY = '__cache';
 const CACHE_MAX = 300;
 const TIMEOUT = 30000; // 首字节 / 相邻分片之间的最长等待
+const LOCAL_TIMEOUT = 120000; // 本地模型首字节经常超过 30s，自动放宽
 const STREAM_INTERVAL = 25; // 合并高频 token，避免每个 SSE 分片都跨扩展端口发送
+
+/** 超时上限：profile 里配置了「超时秒数」就用配置值；本地端点自动放宽 */
+function timeoutFor(cfg) {
+  const configured = Number.parseInt(cfg.timeout, 10);
+  if (Number.isFinite(configured) && configured > 0) return configured * 1000;
+  return /localhost|127\.0\.0\.1|ollama|vllm|lmstudio/.test(cfg.baseUrl || '') ? LOCAL_TIMEOUT : TIMEOUT;
+}
 
 let inFlight = 0;
 const skipLevel = new Map(); // 端点+模型 → 参数降级到第几档，避免每次都从头试探
@@ -73,7 +81,13 @@ async function getGlossary() {
     .then(
       (stored) =>
         (glossary ??= new Map(
-          (stored[GLOSSARY_KEY] || []).map(([scope, terms]) => [scope, new Map(terms)])
+          (stored[GLOSSARY_KEY] || []).map(([scope, terms]) => [
+            scope,
+            new Map(
+              // 旧版本存的是纯字符串译法；读出来统一成 { target, hits }
+              (terms || []).map(([term, v]) => [term, typeof v === 'string' ? { target: v, hits: 1 } : v])
+            ),
+          ])
         ))
     )
     .finally(() => (glossaryLoading = null));
@@ -99,7 +113,9 @@ const HAS_LETTER = /[a-zA-Z一-鿿぀-ヿ가-힯Ѐ-ӿ]/;
 const appears = (term, text) =>
   LATIN.test(term) ? new RegExp(`(^|[^\\w])${escapeRe(term)}([^\\w]|$)`, 'i').test(text) : text.includes(term);
 
-/** 记一条术语；后来的译法覆盖先前的，并刷新为最近使用 */
+/** 记一条术语。同一条目重复记录且译法不一致时保留计数更多的一侧——
+    术语抽取偶尔译错一次，不能让它立刻污染整站后续段落；相同译法则累加计数。
+    （编辑入口见设置页的术语表管理；删除走 forget。） */
 async function remember(scope, term, target, signal) {
   throwIfAborted(signal);
   term = term.trim();
@@ -112,10 +128,29 @@ async function remember(scope, term, target, signal) {
   const g = await getGlossary();
   throwIfAborted(signal);
   const terms = g.get(scope) || new Map();
+  const prev = terms.get(term);
+  let next;
+  if (!prev) next = { target, hits: 1 };
+  else if (prev.target === target) next = { ...prev, hits: prev.hits + 1 };
+  else if (prev.alt === target) {
+    // 异议译法单独计数，追平既有译法才上位——一次误译动摇不了高频译法
+    const altHits = prev.altHits + 1;
+    next = altHits >= prev.hits ? { target, hits: altHits } : { ...prev, altHits };
+  } else next = { ...prev, alt: target, altHits: 1 };
+  terms.delete(term), terms.set(term, next);
   g.delete(scope), g.set(scope, terms); // 作用域也按 LRU
-  terms.delete(term), terms.set(term, target);
   trim(terms, TERMS_PER_SCOPE);
   trim(g, SCOPES_MAX);
+  saveGlossary();
+}
+
+/** 设置页删除单条术语 */
+async function forget(scope, term) {
+  const g = await getGlossary();
+  const terms = g.get(scope);
+  if (!terms) return;
+  terms.delete(term);
+  if (!terms.size) g.delete(scope);
   saveGlossary();
 }
 
@@ -125,7 +160,8 @@ async function glossaryFor(scope, text) {
   const terms = (await getGlossary()).get(scope);
   if (!terms) return [];
   return [...terms]
-    .filter(([term]) => appears(term, text))
+    .filter(([term, v]) => appears(term, text))
+    .map(([term, v]) => [term, v.target])
     .sort((a, b) => b[0].length - a[0].length)
     .slice(0, INJECT_MAX);
 }
@@ -236,9 +272,9 @@ const GLOSSARY_RULES = [
 ];
 
 // 提示词一改，旧译文就不该再拿出来用：这里 +1，缓存整体作废
-const PROMPT_VERSION = 8;
-// 结果完整性规则改变时单独递增，避免继续命中旧版本可能截断的译文
-const CACHE_VERSION = 2;
+const PROMPT_VERSION = 9;
+// 结果完整性规则改变时单独递增，避免继续命中旧版本可能截断（或漏译）的译文
+const CACHE_VERSION = 3;
 
 const numbered = (list) => list.map((s, i) => `${i + 1}. ${s}`).join('\n');
 
@@ -265,8 +301,30 @@ function pageLine(page) {
   return `【来源】${where}${page.desc ? `\n【页面简介】${page.desc}` : ''}`;
 }
 
-/** 页面大纲（content.js 收集的标题骨架）：整篇的结构感，跨章节的指代与术语 */
-const outlineLine = (page) => (page?.outline ? `【本文大纲】\n${page.outline}` : '');
+/** 站点名是义项判断的最低配置：查词任务只带它，不带整页背景 */
+const siteLine = (page) => (page?.site ? `【来源】${page.site}` : '');
+
+/** 页面大纲（content.js 收集的标题骨架）：整篇的结构感，跨章节的指代与术语。
+    长文只保留一级标题和当前段落所在的二级标题——其余标题只会增加首字节的
+    prefill 时间，对这一段的翻译没有额外帮助。 */
+function outlineLine(page, heading = '') {
+  if (!page?.outline) return '';
+  const lines = page.outline.split('\n');
+  if (lines.length <= 8) return `【本文大纲】\n${page.outline}`;
+  const keep = lines.filter((line) => line.startsWith('# '));
+  if (heading) {
+    const at = lines.findIndex((line) => heading && line.includes(heading));
+    if (at >= 0) {
+      for (let i = at; i >= 0; i--)
+        if (lines[i].startsWith('## ')) {
+          keep.push(lines[i]);
+          break;
+        }
+    }
+  }
+  const text = [...new Set(keep)].join('\n');
+  return text ? `【本文大纲】\n${text}` : '';
+}
 
 /** 目标段落附近的有限正文，只帮助消歧，不允许模型翻译或复述。 */
 function surroundingLine(surrounding) {
@@ -287,6 +345,22 @@ const carryLine = (carry) =>
     ? `【前文衔接】前一部分译文的结尾是「…${String(carry).replace(/\s+/g, ' ')}」，术语、人称和语气要接得上，不要重复已经翻译过的内容。`
     : '';
 
+/** 分片并行时替代 carry 的衔接：相邻分片的原文首尾，只读参考。
+    原文在手，不用等任何人——这是并行分片还能接上语气和指代的关键。 */
+const neighborsLine = (neighbors) => {
+  if (!neighbors) return '';
+  const parts = [];
+  if (neighbors.prev) parts.push(`前一部分的结尾是「…${String(neighbors.prev).replace(/\s+/g, ' ')}」`);
+  if (neighbors.next) parts.push(`后一部分的开头是「${String(neighbors.next).replace(/\s+/g, ' ')}…」`);
+  if (!parts.length) return '';
+  return `【相邻分片】${parts.join('；')}。仅供衔接术语、人称和语气，不要翻译或复述这些内容。`;
+};
+
+/** 上一次输出有漏译嫌疑（数字缺失或长度过短）：重发时点名缺的数字 */
+const OMIT_FIX_LINE = (missing) =>
+  `【漏译纠正】上一次的译文不完整${missing?.length ? `，缺少这些数字：${missing.join('、')}` : ''}。` +
+  '把待译正文重新翻译一遍：每一句都要完整译出，数字、日期和单位一个都不能少，不要总结或省略。';
+
 const join = (...parts) => parts.filter(Boolean).join('\n\n');
 
 /** 上一次输出把标记弄丢或写错了：重发时把缺的那几个点名列出来 */
@@ -306,7 +380,7 @@ const LANG_FIX_LINE = (lang) =>
  * 参考资料被模型照抄出来时靠指纹整行截断，正文绝不入指纹。
  */
 function buildPrompt(job, lang) {
-  const { kind, text, context, page, surrounding, tagged, carry, part, terms, repair } = job;
+  const { kind, text, context, page, surrounding, tagged, carry, neighbors, part, terms, repair, omitFix } = job;
 
   if (kind === 'glossary') {
     // 抽取结果本来就由原文的行组成，user 整个不参与指纹
@@ -323,14 +397,20 @@ function buildPrompt(job, lang) {
     };
   }
 
+  // 参考资料按任务类型裁剪：内容越长，首字节前的 prefill 越久，而义项判断
+  // 用不着整页大纲，划词也用不着相邻段落——只有段落翻译保留全部。
   // 事实按「整页稳定 → 每段可变」排列；一块事实都没有时连框架声明也不用带
-  const facts = join(
-    pageLine(page),
-    outlineLine(page),
-    kind === 'block' ? surroundingLine(surrounding) : '',
-    termsLine(terms),
-    carryLine(carry)
-  );
+  const facts =
+    kind === 'term'
+      ? join(siteLine(page))
+      : join(
+          pageLine(page),
+          kind === 'block' ? outlineLine(page, surrounding?.heading) : '',
+          kind === 'block' ? surroundingLine(surrounding) : '',
+          termsLine(terms),
+          carryLine(carry),
+          neighborsLine(neighbors)
+        );
   const reference = facts ? `${REFERENCE_HEAD}\n${facts}` : '';
 
   if (kind === 'term') {
@@ -349,6 +429,26 @@ function buildPrompt(job, lang) {
     };
   }
 
+  if (kind === 'polish') {
+    // 分片长段落译完后的可选「成稿通读」：初稿已交付用户，校对是增量等待。
+    // 目标是修正漏译、误译和跨分片不连贯，而不是整段重写。
+    const rules = RULES(lang);
+    const system = join(
+      `你是资深译审，母语是${lang}。用户给出一段文字的原文和它的译文初稿，请通读并输出修正后的完整译文。`,
+      `要求：\n${numbered(tagged ? [...rules, TAG_RULE] : rules)}`,
+      '以初稿为基础，只修正漏译、误译、术语不一致和语气不连贯的地方，不要整段重写、不要增删内容。',
+      `只输出${lang}译文全文：与初稿分段一一对应，不要解释、不要对比、不要输出思考过程。`
+    );
+    const body = join(`【原文】\n${text}`, `【译文初稿】\n${context}`);
+    return {
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: join(reference, body) },
+      ],
+      echo: join(system, reference, body),
+    };
+  }
+
   // 语言约束在三处重复点名（角色、规则、输出约束），user 的正文前再点一次：
   // 译文跑成别的语言多发生在离正文远的指令被参考资料和原文稀释之后
   const rules = RULES(lang);
@@ -364,14 +464,16 @@ function buildPrompt(job, lang) {
   const bodyLabel = part
     ? `【待译正文】这是长文的第 ${part[0]}/${part[1]} 部分，只翻译发给你的这部分，用${lang}翻译：`
     : `【待译正文】用${lang}翻译：`;
+  // 纠正指令放在正文之后：最后一条指令最容易被听见
   const langNote = job.langFix ? LANG_FIX_LINE(lang) : ''; // 置于正文之后：最后一条指令，纠正语言要的是听话
+  const omitNote = omitFix ? OMIT_FIX_LINE(omitFix) : '';
   const repairNote = repairLine(repair);
   return {
     messages: [
       { role: 'system', content: system },
-      { role: 'user', content: join(reference, bodyLabel, text, langNote, repairNote) },
+      { role: 'user', content: join(reference, bodyLabel, text, langNote, omitNote, repairNote) },
     ],
-    echo: join(system, reference, bodyLabel, langNote, repairNote),
+    echo: join(system, reference, bodyLabel, langNote, omitNote, repairNote),
   };
 }
 
@@ -410,16 +512,51 @@ function missingTags(source, out) {
 /* 目标语言是中文时的验收口径：译文里出现假名或谚文必错；一个汉字都没有、
    而原文又有三个以上拼音文字的词，多半是把翻译做成了照抄。
    专有名词、代码整段保留的合法情形极少见——宁可白重发一次，不能让英文冒充译文。
-   只对中文目标下判断：其他目标语言没有同样便宜的判据，宁可放过。 */
+   目标语言固定为中文，这只对中文下判断；其他目标语言没有同样便宜的判据，宁可放过。 */
 const HAN_CHAR = /[㐀-䶿一-鿿]/;
 const FOREIGN_WORD = /[A-Za-zÀ-ɏЀ-ӿͰ-Ͽ]{2,}/g;
 
-function drifted(targetLang, source, out) {
-  if (!/中文|汉语/.test(targetLang)) return false;
+function drifted(source, out) {
   if (/[぀-ヿ]|[가-힯]/.test(out)) return true; // 中文译文里不会出现假名/谚文
   if (HAN_CHAR.test(out)) return false;
   return (stripMarkers(source).match(FOREIGN_WORD) || []).length >= 3;
 }
+
+/* ---------- 漏译验收：零成本的机械检查，不占等待时间 ---------- */
+
+/** 数字串：千分位分隔符先吃掉（中文译文常把 1,234 写成 1234，但数字本身不能少） */
+const NUM_RUN = /\d+(?:\.\d+)?/g;
+const numbers = (s) => stripMarkers(s).replace(/(\d)[,，](?=\d)/g, '$1').match(NUM_RUN) || [];
+
+/**
+ * 确定性漏译验收（只用于 text / block，查词没有「整段」可查）：
+ * 数字保真——源文里每个数字都该出现在译文里（中文译文保留阿拉伯数字）。
+ * 返回缺失的数字清单（供重发时点名）；长度/单位比的判断见 omissionScore。
+ */
+function omissions(source, out) {
+  const want = numbers(source);
+  if (!want.length) return [];
+  const have = new Map();
+  for (const n of numbers(out)) have.set(n, (have.get(n) || 0) + 1);
+  const missing = [];
+  for (const n of want) {
+    const left = (have.get(n) || 0) - 1;
+    have.set(n, left);
+    if (left < 0) missing.push(n);
+  }
+  return missing;
+}
+
+/** 漏译严重程度：缺失数字条数 + 单位比命中算一条，0 = 通过。重发结果分数更低才算更好。
+    长度比不能按字符数算——英文译成中文按字符通常缩到 1/5 以下，好译文会被误判；
+    改按「内容单位」（外语词、汉字各算一个）比：漏掉整句时单位数会明显跟不上。 */
+const CONTENT_UNIT = /[A-Za-zÀ-ɏЀ-ӿͰ-Ͽ]{2,}|[㐀-䶿一-鿿]/g;
+const unitCount = (s) => (s.match(CONTENT_UNIT) || []).length;
+const omissionScore = (source, out) => {
+  if (!out) return Infinity;
+  const short = unitCount(out) < unitCount(source) * 0.3;
+  return omissions(source, out).length + (short ? 1 : 0);
+};
 
 /* ---------- 长段落分片：整段直发会漏译、后半段质量下滑，还可能撞输出上限 ---------- */
 
@@ -500,18 +637,100 @@ function splitChunks(source, limit = CHUNK_LIMIT) {
   return chunks.filter((c) => c.text);
 }
 
-/** 串行翻译各分片：后一片带上前一片译文的结尾，保证术语和语气连贯 */
-async function translateChunks(cfg, job, chunks, onChunk, signal) {
-  let done = '';
-  for (let i = 0; i < chunks.length; i++) {
-    const { text, sep, terms } = chunks[i];
+/** 分片并发的上限：几片同时发；上屏仍严格按原文顺序 */
+const CHUNK_CONCURRENT = 3;
+
+/**
+ * 翻译各分片。默认有界并行（快是第一位）：分片之间互不等待，并发不超过
+ * CHUNK_CONCURRENT，完成结果放进槽位，前面的槽位齐了才按原文顺序拼接上屏。
+ * 连贯性不靠等待：每个分片在参考资料里带上相邻分片的原文首尾（neighborsLine），
+ * 术语统一靠术语表注入（分片各自的快照）。
+ * 「连贯优先」（cfg.parallel === false）退回串行：后一片带上前一片译文的结尾。
+ * onProgress 是旁路信号（「x/y」），不干扰流式文本通道与押稿逻辑。
+ */
+async function translateChunks(cfg, job, chunks, onChunk, signal, onProgress = null) {
+  const n = chunks.length;
+  if (n === 1 || cfg.parallel === false) return translateChunksSerially(cfg, job, chunks, onChunk, signal, onProgress);
+
+  const results = Array(n).fill(null); // 槽位：分片完成后按序放出
+  let frontier = 0; // 第一个尚未完成的分片：只有它能流式上屏
+  let doneCount = 0;
+  const progress = () => onProgress?.(`${doneCount}/${n}`, doneCount < n);
+  const stitched = (upto) => {
+    let out = '';
+    for (let i = 0; i < upto; i++) out += results[i];
+    return out;
+  };
+  const flush = () => {
+    let at = frontier;
+    while (at < n && results[at] !== null) at++;
+    if (at === frontier) return;
+    frontier = at;
+    // 全部完成时终稿与最后一帧一字不差，前端不必再画一遍
+    onChunk(at === n ? stitched(n).trimEnd() : stitched(at));
+  };
+
+  const run = async (i) => {
+    const { text, sep } = chunks[i];
     const sub = {
       ...job,
       text,
       // 首层分片已经固定了术语快照供缓存键复用；截断恢复产生的新分片则在这里读取
-      terms: terms ?? (await glossaryFor(job.scope, text)),
+      terms: chunks[i].terms ?? (await glossaryFor(job.scope, text)),
+      neighbors: {
+        prev: i > 0 ? chunks[i - 1].text.slice(-200) : '',
+        next: i < n - 1 ? chunks[i + 1].text.slice(0, 200) : '',
+      },
+      part: n > 1 ? [i + 1, n] : null,
+    };
+    let out;
+    try {
+      out = await translateOne(cfg, sub, (p) => i === frontier && onChunk(stitched(i) + p), signal);
+    } catch (error) {
+      if (error.code !== 'truncated' || text.length <= MIN_RECOVERY_CHUNK * 2) throw error;
+      const smaller = splitChunks(text, Math.ceil(text.length / 2));
+      if (smaller.length < 2) throw error;
+      out = await translateChunks(cfg, { ...job, terms: sub.terms }, smaller, (p) => onChunk(stitched(i) + p), signal);
+    }
+    results[i] = out + (i < n - 1 ? sep || '\n' : '');
+    doneCount++;
+    flush();
+    progress();
+  };
+
+  progress(); // 先报 0/n：长段落从一开始就知道会分几片
+  let failure = null;
+  let next = 0;
+  const worker = async () => {
+    while (failure === null && !signal?.aborted) {
+      const i = next++;
+      if (i >= n) return;
+      try {
+        await run(i);
+      } catch (e) {
+        failure ??= e;
+        return;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CHUNK_CONCURRENT, n) }, worker));
+  if (failure) throw failure;
+  return stitched(n).trimEnd();
+}
+
+/** 串行翻译各分片：后一片带上前一片译文的结尾，保证术语和语气连贯（「连贯优先」模式） */
+async function translateChunksSerially(cfg, job, chunks, onChunk, signal, onProgress = null) {
+  const n = chunks.length;
+  let done = '';
+  if (n > 1) onProgress?.(`0/${n}`, true);
+  for (let i = 0; i < n; i++) {
+    const { text, sep } = chunks[i];
+    const sub = {
+      ...job,
+      text,
+      terms: chunks[i].terms ?? (await glossaryFor(job.scope, text)),
       carry: done ? done.trimEnd().slice(-160) : job.carry || '',
-      part: chunks.length > 1 ? [i + 1, chunks.length] : null,
+      part: n > 1 ? [i + 1, n] : null,
     };
     let out;
     try {
@@ -520,10 +739,11 @@ async function translateChunks(cfg, job, chunks, onChunk, signal) {
       if (error.code !== 'truncated' || text.length <= MIN_RECOVERY_CHUNK * 2) throw error;
       const smaller = splitChunks(text, Math.ceil(text.length / 2));
       if (smaller.length < 2) throw error;
-      out = await translateChunks(cfg, { ...job, carry: sub.carry }, smaller, (p) => onChunk(done + p), signal);
+      out = await translateChunksSerially(cfg, { ...job, carry: sub.carry }, smaller, (p) => onChunk(done + p), signal);
     }
-    done += out + (i < chunks.length - 1 ? sep || '\n' : '');
-    if (i === chunks.length - 1) done = done.trimEnd(); // 最后一帧与终稿一字不差，前端不必再画一遍
+    done += out + (i < n - 1 ? sep || '\n' : '');
+    if (i === n - 1) done = done.trimEnd(); // 最后一帧与终稿一字不差，前端不必再画一遍
+    onProgress?.(`${i + 1}/${n}`, i < n - 1);
     onChunk(done);
   }
   return done;
@@ -560,29 +780,50 @@ function gateDraft(sub, onChunk) {
 }
 
 /**
- * 翻译一片；译文跑成别的语言或带标记的译文丢了标记时，点名重发一次（温度 0）。
- * 只在出错时多花一次请求，正常情况零开销。
+ * 翻译一片；译文跑成别的语言、疑似漏译或带标记的译文丢了标记时，点名重发一次（温度 0）。
+ * 只在出错时多花一次请求，正常情况零开销。首稿照常先上屏，校验全部在后台追加。
  * 补发不走流式回调：已经上屏的首稿保持显示（补发可能等 30 秒，不能让已读到的文字消失），
  * 采用补发结果时再替换；被押住没上屏的首稿让页面停在加载动画，直接等补发结果。
  */
 async function translateOne(cfg, sub, onChunk, signal) {
   let shown = false; // 首稿有没有真的上过屏：被押住的首稿没有
   const out = await request(cfg, sub, gateDraft(sub, (text) => ((shown = true), onChunk(text))), signal);
-  // 语言漂移先于标记检查：语言错了的译文不值得为它修标记。
+  // 语言漂移先于其他检查：语言错了的译文不值得为它修别的问题。
   // 只查正文两类：查词允许专有名词原样返回，没有「整段」可查；已经修过语言的不再重修
   let settled = out;
   if (
     (sub.kind === 'text' || sub.kind === 'block') &&
     !sub.langFix &&
+    !sub.omitFix &&
     !sub.repair &&
-    drifted(cfg.targetLang, sub.text, out)
+    drifted(sub.text, out)
   ) {
     if (shown) onChunk(out);
     try {
       const retry = await request(cfg, { ...sub, langFix: true }, () => {}, signal);
-      if (!drifted(cfg.targetLang, sub.text, retry)) {
+      if (!drifted(sub.text, retry)) {
         settled = retry;
         shown = false; // 押住首稿的页面直接等这份，不再有旧首稿可放行
+      }
+    } catch (e) {
+      if (signal?.aborted) throw e;
+    }
+  }
+  // 漏译验收：数字缺失或长度过短时点名重发一次，重发结果更好才替换
+  if (
+    (sub.kind === 'text' || sub.kind === 'block') &&
+    !sub.langFix &&
+    !sub.omitFix &&
+    !sub.repair &&
+    omissionScore(sub.text, settled) > 0
+  ) {
+    const missing = omissions(sub.text, settled);
+    if (shown) onChunk(settled);
+    try {
+      const retry = await request(cfg, { ...sub, omitFix: missing }, () => {}, signal);
+      if (omissionScore(sub.text, retry) < omissionScore(sub.text, settled)) {
+        settled = retry;
+        shown = false;
       }
     } catch (e) {
       if (signal?.aborted) throw e;
@@ -620,7 +861,7 @@ function canonicalJson(value) {
     语境弱化：页面标题/简介/大纲/相邻段落都进提示词但不进缓存键——它们随时在变
     （时间戳、轮播、SPA 挪动段落），参与键会让同一段文字反复未命中重新计费，
     而同一段文字在轻微不同的语境里值得的就是同一份译文。站点和查词所在句仍参与：
-    前者稳定，后者直接决定义项。 */
+    前者稳定，后者直接决定义项。分片串行/并行改变的是请求内容，也参与。 */
 function cacheKeyFor(cfg, job, chunkTerms = []) {
   return canonicalJson([
     CACHE_VERSION,
@@ -628,6 +869,7 @@ function cacheKeyFor(cfg, job, chunkTerms = []) {
     cfg.baseUrl.replace(/\/+$/, ''),
     cfg.model,
     cfg.targetLang,
+    cfg.parallel !== false,
     requestExtras(cfg),
     job.kind,
     !!job.tagged,
@@ -639,22 +881,24 @@ function cacheKeyFor(cfg, job, chunkTerms = []) {
 }
 
 /** 一次翻译固定使用同一份配置，并把后处理需要的上下文随结果返回。 */
-async function translateWithContext(job, onChunk = () => {}, signal) {
+async function translateWithContext(job, onChunk = () => {}, signal, onProgress = null) {
   throwIfAborted(signal);
-  const { active: cfg } = await loadConfig(); // 当前 profile，切换后下一次翻译立即生效
+  const { active: cfg, parallel } = await loadConfig(); // 当前 profile，切换后下一次翻译立即生效
+  cfg.parallel = parallel;
   throwIfAborted(signal);
   if (!cfg.apiKey) throw fail('还没有配置 API Key', 'no-key');
 
   const scope = scopeOf(cfg, job.page);
   const chunks = splitChunks(job.text);
   // 缓存必须与真正注入每个分片的术语一致，否则术语更新后还会命中旧译文。
+  // 查词不带术语：义项不该被术语表锚死（它自己正是术语表的来源之一）。
   // 同时读取两份 storage，冷启动时不互相阻塞。
   const [c, preparedChunks] = await Promise.all([
     getCache(),
     Promise.all(
       chunks.map(async (chunk) => ({
         ...chunk,
-        terms: await glossaryFor(scope, chunk.text),
+        terms: job.kind === 'term' ? [] : await glossaryFor(scope, chunk.text),
       }))
     ),
   ]);
@@ -664,7 +908,8 @@ async function translateWithContext(job, onChunk = () => {}, signal) {
     job,
     preparedChunks.map(({ terms }) => terms)
   );
-  const hit = c.get(key);
+  // force：译文成功过但用户觉得不好——跳过缓存直接重译，成功后覆写原条目
+  const hit = job.force ? undefined : c.get(key);
   if (hit !== undefined) {
     c.delete(key), c.set(key, hit); // 命中即刷新为最近使用；只是换了顺序，不值得整张表重写一遍落盘
     onChunk(hit);
@@ -675,15 +920,39 @@ async function translateWithContext(job, onChunk = () => {}, signal) {
   if (inFlight >= MAX_CONCURRENT) throw fail(`同时进行的翻译已达 ${MAX_CONCURRENT} 个上限，请稍后再试`);
   inFlight++;
   try {
-    // 分片只占一个并发名额：它们本来就是串行的
-    const out = await translateChunks(cfg, { ...job, scope }, preparedChunks, onChunk, signal);
-    c.set(key, out);
+    // 分片只占一个并发名额：分片内部的并发由 CHUNK_CONCURRENT 另行约束
+    const out = await translateChunks(cfg, { ...job, scope }, preparedChunks, onChunk, signal, onProgress);
+    let final = out;
+    // 可选的「成稿通读」：分片并行后跨分片的长距离指代失去串行衔接的保障，
+    // 全部分片完成后把全文初稿再通读一遍。初稿已经上屏，这一步是增量等待；
+    // 结果经过同样的漏译验收才替换，失败静默维持初稿。
+    if (cfg.polish && chunks.length > 1 && !job.force && !signal?.aborted) {
+      try {
+        const polished = await translateOne(
+          cfg,
+          { kind: 'polish', text: job.text, context: out, tagged: job.tagged, scope },
+          () => {},
+          signal
+        );
+        if (
+          polished &&
+          (!job.tagged || !missingTags(job.text, polished).length) &&
+          omissionScore(job.text, polished) <= omissionScore(job.text, out)
+        ) {
+          final = polished;
+          onChunk(final.trimEnd());
+        }
+      } catch (e) {
+        if (signal?.aborted) throw e; // 其余失败都静默：校对是锦上添花
+      }
+    }
+    c.set(key, final);
     for (const k of c.keys()) {
       if (c.size <= CACHE_MAX) break;
       c.delete(k);
     }
     saveCache();
-    return { text: out, cfg, scope, fromCache: false };
+    return { text: final, cfg, scope, fromCache: false };
   } finally {
     inFlight--;
   }
@@ -742,8 +1011,9 @@ async function extractTerms(cfg, scope, source, target, signal) {
 /* ---------- 请求 ---------- */
 
 /* 查词和抽术语要唯一解，段落要通顺，所以温度分档 */
-const TEMPERATURE = { term: 0, text: 0.2, block: 0.3, glossary: 0 };
-const temperatureOf = (job) => (job.repair || job.langFix ? 0 : TEMPERATURE[job.kind] ?? 0.2); // 纠错要的是听话，不是通顺
+const TEMPERATURE = { term: 0, text: 0.2, block: 0.3, glossary: 0, polish: 0.2 };
+// 纠错要的是听话，不是通顺
+const temperatureOf = (job) => (job.repair || job.langFix || job.omitFix ? 0 : TEMPERATURE[job.kind] ?? 0.2);
 
 /** 防止长段落被端点的默认输出上限截断；o 系 / gpt-5 换了字段名 */
 const MAX_OUTPUT_TOKENS = 4096;
@@ -781,9 +1051,10 @@ async function request(cfg, job, onChunk, signal) {
   const abort = () => ctrl.abort(signal.reason);
   signal?.addEventListener('abort', abort, { once: true });
   let timer;
+  const limit = timeoutFor(cfg);
   const alive = () => {
     clearTimeout(timer);
-    timer = setTimeout(() => ctrl.abort(fail('timeout', 'timeout')), TIMEOUT);
+    timer = setTimeout(() => ctrl.abort(fail('timeout', 'timeout')), limit);
   };
 
   const post = (extra) =>
@@ -843,7 +1114,7 @@ async function request(cfg, job, onChunk, signal) {
   } catch (e) {
     if (signal?.aborted) throw e; // 用户主动取消，外层会忽略
     if (e.code === 'timeout' || ctrl.signal.reason?.code === 'timeout')
-      throw fail(`等待响应超过 ${TIMEOUT / 1000} 秒，请重试`, 'timeout');
+      throw fail(`等待响应超过 ${Math.round(limit / 1000)} 秒，请重试`, 'timeout');
     if (e.name === 'TypeError') throw fail('连不上接口地址，请检查网络和 Base URL', 'network');
     throw e;
   } finally {
@@ -950,7 +1221,8 @@ async function speak(text, lang) {
   if (text.length > TTS_LIMIT) throw new Error('这段文字太长，无法发音');
   await ensureOffscreen();
   const res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'play', url: ttsUrl(text, lang) });
-  if (res?.error) throw new Error(res.error);
+  if (res?.error) return { fallback: true }; // 非官方端点限流/改版：让页面自带的 speechSynthesis 顶上
+  return {};
 }
 
 /* ---------- 与内容脚本 / 设置页通信 ---------- */
@@ -984,7 +1256,8 @@ chrome.runtime.onConnect.addListener((port) => {
       const result = await translateWithContext(
         job,
         (text) => post({ chunk: text }),
-        ctrl.signal
+        ctrl.signal,
+        (progress) => post({ progress }) // 分片进度的旁路信号，不占流式文本通道
       );
       if (!post({ done: true, text: result.text })) return;
       // 先把译文交给用户，再抽术语。端口留到这一步之后才断，
@@ -1011,7 +1284,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   switch (msg?.type) {
     case 'speak': // 气泡上的喇叭按钮
       speak(msg.text, msg.lang).then(
-        () => sendResponse({ ok: true }),
+        (r) => sendResponse({ ok: true, ...r }),
         (err) => sendResponse({ error: err.message })
       );
       return true;
@@ -1027,6 +1300,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     case 'clearCache':
       clearStoredData().then(() => sendResponse({ ok: true }));
       return true;
+    case 'glossaryList': // 设置页的术语表管理：按「站点 + 目标语言」全量读出
+      getGlossary().then((g) =>
+        sendResponse({
+          scopes: [...g].map(([scope, terms]) => [
+            scope,
+            [...terms].map(([term, v]) => [term, v.target, v.hits]),
+          ]),
+        })
+      );
+      return true;
+    case 'glossarySet': // 单条编辑/新增，走与翻译共用的 remember 接口
+      remember(msg.scope, msg.term, msg.target).then(
+        () => sendResponse({ ok: true }),
+        (err) => sendResponse({ error: err.message })
+      );
+      return true;
+    case 'glossaryDelete': // 单条删除
+      forget(msg.scope, msg.term).then(() => sendResponse({ ok: true }));
+      return true;
     default:
       return false;
   }
@@ -1038,6 +1330,7 @@ function createMenus() {
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({ id: 'tr-sel', title: '翻译选中文字', contexts: ['selection'] });
     chrome.contextMenus.create({ id: 'tr-block', title: '翻译此段落', contexts: ['page'] });
+    chrome.contextMenus.create({ id: 'tr-page', title: '翻译此页', contexts: ['page'] });
   });
 }
 
@@ -1050,6 +1343,11 @@ chrome.runtime.onStartup.addListener(() => (createMenus(), ensureProfiles()));
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (!tab?.id) return;
-  const type = info.menuItemId === 'tr-sel' ? 'translate-selection' : 'translate-block';
+  const type =
+    info.menuItemId === 'tr-sel'
+      ? 'translate-selection'
+      : info.menuItemId === 'tr-page'
+        ? 'translate-page'
+        : 'translate-block';
   chrome.tabs.sendMessage(tab.id, { type }, { frameId: info.frameId ?? 0 }).catch(() => {});
 });

@@ -71,6 +71,14 @@
   #status.ok b { color: var(--ok); }
   #status.bad b { color: var(--bad); }
   #status span { display: block; margin-top: 2px; color: var(--soft); word-break: break-word; user-select: text; }
+
+  /* 术语表管理 */
+  #glossaryList .scope { margin: 8px 0 2px; font-size: 11px; color: var(--soft); }
+  #glossaryList .term { display: flex; gap: 4px; align-items: center; margin: 4px 0; }
+  #glossaryList .term input { margin: 0; flex: 1; min-width: 0; padding: 3px 6px; }
+  #glossaryList .term .hits { flex: none; font-size: 11px; color: var(--soft); }
+  #glossaryList .term button { flex: none; width: 22px; padding: 2px 0; font-size: 11px; }
+  #glossaryList .empty { font-size: 11px; color: var(--soft); }
 </style>
 </head>
 <body>
@@ -102,8 +110,10 @@
   <input type="text" id="modelCustom" placeholder="gpt-4o-mini" spellcheck="false" hidden />
   <p class="hint" id="modelHint"></p>
 
-  <label for="targetLang">目标语言</label>
-  <input type="text" id="targetLang" placeholder="简体中文" />
+  <div hidden id="targetLangRow">
+    <label for="targetLang">目标语言</label>
+    <input type="text" id="targetLang" placeholder="简体中文" />
+  </div>
 
   <label class="check"><input type="checkbox" id="noThink" />关闭模型思考，降低等待时间</label>
 
@@ -112,6 +122,10 @@
     <label class="check"><input type="checkbox" id="glossary" />长段落译完后抽取术语</label>
     <p class="hint">记住本站已用过的译法，后续段落沿用，同一个词不会前后不一。每段会多花一次很短的请求；
       查词结果和短译文入表不受此开关影响。</p>
+    <label class="check"><input type="checkbox" id="polish" />长段落译完后再通读一遍成稿</label>
+    <p class="hint">分片并行翻译后，可选地用一次请求校对全文的漏译和指代；初稿照常先显示，校对是增量等待。</p>
+    <label for="timeout">超时秒数</label>
+    <input type="text" id="timeout" placeholder="留空自动：普通 30s，本地模型 120s" spellcheck="false" />
     <label for="extraBody">额外请求参数</label>
     <input type="text" id="extraBody" placeholder='{"reasoning_effort":"none"}' spellcheck="false" />
     <p class="hint">合并进请求体的 JSON，覆盖自动判断。</p>
@@ -127,9 +141,22 @@
   </select>
   <p class="hint" id="hotkeyHint"></p>
 
+  <label class="check"><input type="checkbox" id="parallel" />长段落分片并行翻译（快）</label>
+  <p class="hint">关掉后退回串行衔接：后一片等前一片的译文结尾，长难句场景更连贯，但更慢。</p>
+
   <div class="site" id="siteRow" hidden>
     <label class="check"><input type="checkbox" id="siteOn" />在 <code id="siteName"></code> 上启用</label>
   </div>
+
+  <div class="site" id="pageRow" hidden>
+    <button type="button" id="stopPage" class="link">停止整页翻译</button>
+  </div>
+
+  <details id="glossaryBox">
+    <summary>术语表管理</summary>
+    <p class="hint">按站点保存的已确定译法，编辑后立即生效，删除后由模型重新决定。</p>
+    <div id="glossaryList"></div>
+  </details>
 
   <button type="button" id="clearCache" class="link">清空译文缓存与术语表</button>
 

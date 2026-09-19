@@ -20,12 +20,15 @@ const PROFILE_FIELDS = {
   targetLang: '简体中文',
   noThink: true,
   glossary: true,
+  polish: false, // 分片长段落译完后再通读一遍成稿（默认关：快是第一位）
+  timeout: '', // 超时秒数；空值按端点自动判断（本地模型放宽到 120s）
   extraBody: '',
 };
 
 const GLOBAL_FIELDS = {
   hotkey: 'Control',
   disabledHosts: [],
+  parallel: true, // 长段落分片并行；关掉退回串行衔接（长难句场景的「连贯优先」）
 };
 
 // 首个 profile 用固定 id：多个上下文同时迁移旧配置时结果也一致，不会各造一个

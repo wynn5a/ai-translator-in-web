@@ -326,6 +326,92 @@ $('clearCache').onclick = async () => {
   say('ok', '译文缓存与术语表已清空');
 };
 
+/* ---------- 分片并行（全局） ---------- */
+
+$('parallel').checked = true;
+chrome.storage.local.get({ parallel: true }).then(({ parallel }) => ($('parallel').checked = parallel !== false));
+$('parallel').onchange = (e) => chrome.storage.local.set({ parallel: e.target.checked });
+
+/* ---------- 整页翻译的停止入口（仅作为工具栏弹窗打开时显示） ---------- */
+
+chrome.tabs?.query({ active: true, currentWindow: true }).then(([tab]) => {
+  if (/^https?:/.test(tab?.url || '')) {
+    $('pageRow').hidden = false;
+    $('stopPage').onclick = async () => {
+      await chrome.tabs.sendMessage(tab.id, { type: 'stopPage' }).catch(() => {});
+      say('ok', '已停止整页翻译');
+    };
+  }
+});
+
+/* ---------- 术语表管理 ---------- */
+
+const glossaryBox = $('glossaryList');
+
+/** scope 形如 `site\x01目标语言`，拆开给人看 */
+const scopeLabel = (scope) => scope.replace('\x01', ' · ');
+
+function glossaryRow(scope, term, target, hits) {
+  const row = document.createElement('div');
+  row.className = 'term';
+  const source = document.createElement('input');
+  source.value = term;
+  source.title = '原文';
+  source.spellcheck = false;
+  const translated = document.createElement('input');
+  translated.value = target;
+  translated.title = '译法';
+  translated.spellcheck = false;
+  const count = document.createElement('span');
+  count.className = 'hits';
+  count.textContent = `${hits}`;
+  count.title = `被 ${hits} 段采用过`;
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.textContent = '✕';
+  del.title = '删除这条术语';
+  // 失焦且真的改了才写回：编辑走 remember 接口，与翻译共用同一套校验
+  const save = async () => {
+    const nextTerm = source.value.trim();
+    const nextTarget = translated.value.trim();
+    if (!nextTerm || !nextTarget || (nextTerm === term && nextTarget === target)) return;
+    if (nextTerm !== term) await chrome.runtime.sendMessage({ type: 'glossaryDelete', scope, term });
+    await chrome.runtime.sendMessage({ type: 'glossarySet', scope, term: nextTerm, target: nextTarget });
+    say('ok', '术语已更新');
+  };
+  source.onchange = save;
+  translated.onchange = save;
+  del.onclick = async () => {
+    await chrome.runtime.sendMessage({ type: 'glossaryDelete', scope, term });
+    row.remove();
+    say('ok', `已删除「${term}」`);
+  };
+  row.append(source, translated, count, del);
+  return row;
+}
+
+// 展开时再读，编辑期间存储可能被翻译写回刷新
+$('glossaryBox').addEventListener('toggle', () => {
+  if (!$('glossaryBox').open) return;
+  chrome.runtime.sendMessage({ type: 'glossaryList' }).then(({ scopes }) => {
+    glossaryBox.replaceChildren();
+    const list = scopes || [];
+    if (!list.length) {
+      const empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = '还没有术语。查词、短译文入表或长段落抽取后出现在这里。';
+      glossaryBox.append(empty);
+      return;
+    }
+    for (const [scope, terms] of list) {
+      const head = document.createElement('p');
+      head.className = 'scope';
+      head.textContent = scopeLabel(scope);
+      glossaryBox.append(head, ...terms.map(([term, target, hits]) => glossaryRow(scope, term, target, hits || 1)));
+    }
+  });
+});
+
 /* ---------- 保存与测试 ---------- */
 
 $('save').onclick = async () => (await save()) && say('ok', '已保存');

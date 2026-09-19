@@ -127,29 +127,15 @@ function paragraphContext(block) {
 
 /* ---------- 语种判断：与目标语言一致才跳过 ---------- */
 
-/* 正则只认文字系统：日/韩/俄按字符集就足够准。拉丁字母是例外——
-   正则分不出英法德，若在里面给英语判型，法文德文全被当成英语，
-   目标语言是 English 时整段法译英会被误判成「已经是英语」跳过。
-   所以拉丁文字一律标成 latin，具体语种交给 chrome.i18n.detectLanguage。 */
+/* 目标语言固定为中文，正则只认文字系统就够了：日/韩/俄按字符集直接判定。
+   拉丁字母（英法德…）永远不是中文，不再需要 CLD 细分——触发路径上没有
+   任何异步检测。拉丁分支只在发音时用来取语种码（见 speakLang）。 */
 const SCRIPTS = [
   ['ja', /[぀-ヿ]/g, 0.05], // 假名出现即判为日语（日文含汉字）
   ['ko', /[가-힯]/g, 0.3],
   ['zh', /[㐀-䶿一-鿿]/g, 0.3],
   ['ru', /[Ѐ-ӿ]/g, 0.3],
   ['latin', /[A-Za-zÀ-ɏ]/g, 0.3],
-];
-
-const TARGETS = [
-  [/中文|汉语|漢語|chinese|mandarin/i, 'zh'],
-  [/日本語|日语|japanese/i, 'ja'],
-  [/한국|韩语|korean/i, 'ko'],
-  [/русск|俄语|russian/i, 'ru'],
-  [/english|英语|英文/i, 'en'],
-  [/français|法语|法文|french/i, 'fr'],
-  [/deutsch|德语|德文|german/i, 'de'],
-  [/español|西班牙语|西班牙文|spanish/i, 'es'],
-  [/português|葡萄牙语|葡萄牙文|portuguese/i, 'pt'],
-  [/italiano|意大利语|意大利文|italian/i, 'it'],
 ];
 
 function detectScript(text) {
@@ -163,8 +149,8 @@ function detectScript(text) {
 
 /** 具体语种：非拉丁文字用上面的正则结果；拉丁文字问 CLD，取占比最高的一种，
     砍掉地区码（zh-CN → zh）。占比的刻度有的实现是 0–100 有的是 0–1，按占比算不受影响；
-    占比不过半（混合文本、拿不准）和检测失败都返回空——
-    多翻一次没有害处，误判成「已经是目标语言」就真丢了一段译文。 */
+    占比不过半（混合文本、拿不准）和检测失败都返回空。
+    只在发音路径上使用（异步没有关系）：触发路径的「是不是中文」用 alreadyTarget。 */
 async function detectLang(text) {
   const script = detectScript(text);
   if (script !== 'latin') return script;
@@ -178,10 +164,11 @@ async function detectLang(text) {
   }
 }
 
-/** 只有识别出的语种与目标语言相同才跳过；目标语言无法识别时一律翻译 */
-async function alreadyTarget(text) {
-  const target = TARGETS.find(([re]) => re.test(cfg.targetLang))?.[1];
-  return !!target && (await detectLang(text)) === target;
+/** 目标语言固定为中文：文字系统是中文就跳过，不必问 CLD。
+    日/韩排在中文之前（假名/谚文优先判定），含汉字的日文不会误判成中文；
+    拿不准（混合文本、无文字）一律返回 false——宁多翻一次，不误跳过。 */
+function alreadyTarget(text) {
+  return detectScript(text) === 'zh';
 }
 
 /** 从鼠标所在节点向上找到最近的、含足量文字的块级元素 */
@@ -222,7 +209,12 @@ const PAGE_CSS = `${DOTS_CSS}
 /* 错误提示不是译文：不降不透明度，也不参与淡入——动画期间会盖住内联的 opacity:1，闪一下再变实 */
 [data-ai-translation].ai-tr-err{animation:none;opacity:1}
 @keyframes ai-tr-in{from{opacity:0}}
-@media (prefers-reduced-motion:reduce){[data-ai-translation]{animation:none}}`;
+@media (prefers-reduced-motion:reduce){[data-ai-translation]{animation:none}}
+/* 分片进度小字：译文节点左上角，随分片完成递增，译完移除 */
+.ai-tr-progress{display:block;font-size:.75em;line-height:1.4;opacity:.55}
+/* 段落译文尾部的复制/重译：hover 译文时显形，不抢正文的一眼可辨 */
+.ai-tr-actions{white-space:nowrap;font-size:.85em;opacity:0;transition:opacity .12s}
+[data-ai-translation]:hover .ai-tr-actions,.ai-tr-actions:focus-within{opacity:.75}`;
 
 let pageStyled = false;
 function injectPageCss() {
@@ -343,13 +335,34 @@ function showTip(content, { error = false, hint = false, actions = [], inline = 
     ...actions.map(({ label, onClick }) => {
       const b = document.createElement('button');
       b.textContent = label;
-      b.onclick = onClick;
+      b.onclick = () => onClick(b); // 传回按钮本身：复制成功要改它自己的文字
       return b;
     })
   );
   tipBar.hidden = !actions.length;
   tipEl.hidden = false;
   place();
+}
+
+/** 复制译文：成功后把按钮文字变成「已复制」1.5 秒 */
+function copyAction(getText) {
+  return {
+    label: '复制',
+    onClick: async (btn) => {
+      try {
+        await navigator.clipboard.writeText(getText());
+        btn.textContent = '已复制';
+      } catch {
+        btn.textContent = '复制失败';
+      }
+      setTimeout(() => (btn.textContent = '复制'), 1500);
+    },
+  };
+}
+
+/** 重译：绕过缓存重新请求（成功后覆写缓存条目） */
+function retranslateAction(retry) {
+  return { label: '重译', onClick: () => retry() };
 }
 
 function place() {
@@ -406,6 +419,41 @@ function flash(a, text) {
 
 const isTerm = (t) => t.split(/\s+/).length <= 5 && !/[.!?。！？]/.test(t);
 
+/** 常见缩写：句点前的这些词不断句（Dr. Smith、e.g. the…） */
+const ABBREVIATIONS = new Set([
+  'e.g', 'i.e', 'etc', 'vs', 'cf', 'al', 'Dr', 'Mr', 'Mrs', 'Ms', 'Prof', 'St',
+  'no', 'No', 'Fig', 'fig', 'Jr', 'Sr', 'Inc', 'Ltd', 'Co', 'approx', 'Vol',
+  'Ch', 'Sec', 'Ref', 'Eq', 'Dept', 'Univ', 'ca', 'p', 'pp',
+]);
+
+/** text[i] 是句末候选标点，判断它是不是真的句尾。两条否决：
+    1. 句点后第一个非空白字符是小写字母或数字（e.g. you、v1.2. 3、No. 5）；
+    2. 句点前是常见缩写（Dr.、Mr.、Fig.）。 */
+function isSentenceEnd(text, i) {
+  const ch = text[i];
+  if (ch === ';' || ch === '；') return true; // 分号永远是边界
+  const rest = text.slice(i + 1);
+  const next = rest.match(/^\s*(\S)/)?.[1];
+  if (next && /[a-z\d]/.test(next)) return false;
+  const frag = text.slice(Math.max(0, i - 6), i).match(/[A-Za-z.]+$/)?.[0];
+  if (frag && ABBREVIATIONS.has(frag.replace(/^\.+|\.+$/g, ''))) return false;
+  return true;
+}
+
+/** 选区之前最后一个句尾（返回其后的起始下标）；找不到从 0 开始 */
+function prevSentenceEnd(text) {
+  for (let i = text.length - 1; i >= 0; i--)
+    if (/[.!?。！？;；]/.test(text[i]) && isSentenceEnd(text, i)) return i + 1;
+  return 0;
+}
+
+/** 选区之后第一个句尾（返回标点所在的下标）；分号不算；找不到返回 -1 */
+function nextSentenceEnd(text) {
+  for (let i = 0; i < text.length; i++)
+    if (/[.!?。！？]/.test(text[i]) && isSentenceEnd(text, i)) return i;
+  return -1;
+}
+
 function sentenceAround(range) {
   const block = findBlock(range.startContainer);
   if (!block) return '';
@@ -418,10 +466,10 @@ function sentenceAround(range) {
   const at = head.toString().length;
   const end = at + range.toString().length;
 
-  const before = [...full.slice(0, at).matchAll(/[.!?。！？;；]\s/g)].pop();
-  const after = full.slice(end).search(/[.!?。！？](\s|$)/);
+  const before = prevSentenceEnd(full.slice(0, at));
+  const after = nextSentenceEnd(full.slice(end));
   const sentence = full
-    .slice(before ? before.index + before[0].length : 0, after < 0 ? full.length : end + after + 1)
+    .slice(before, after < 0 ? full.length : end + after + 1)
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -466,6 +514,19 @@ function speakButton(text, lang) {
       .catch(() => ({ error: '扩展已更新或被禁用，请刷新页面后重试' }));
     btn.disabled = false;
     if (!res?.error) return (btn.title = '朗读原文');
+    // Google 端点限流/改版时回退到页面自带的 speechSynthesis：
+    // 它不是网络请求，宿主页的 media-src CSP 管不到它。质量差一点但能用。
+    if (res.fallback) {
+      try {
+        const u = new SpeechSynthesisUtterance(text);
+        if (lang) u.lang = lang;
+        u.onerror = () => ((btn.classList.add('bad')), (btn.title = '发音失败'));
+        speechSynthesis.speak(u);
+        return;
+      } catch {
+        /* 没有 speechSynthesis 就只能报错 */
+      }
+    }
     btn.classList.add('bad'); // 气泡正文是译文，不能被一句报错顶掉
     btn.title = res.error;
   };
@@ -474,7 +535,7 @@ function speakButton(text, lang) {
 
 /* ---------- 后台通信（流式） ---------- */
 
-function requestTranslation(payload, onPartial) {
+function requestTranslation(payload, onPartial, onProgress = null) {
   let port;
   let finish = () => {};
   let close = () => {};
@@ -500,7 +561,8 @@ function requestTranslation(payload, onPartial) {
     };
     port.onMessage.addListener((m) => {
       if (settled) return;
-      if (m.chunk !== undefined) {
+      if (m.progress !== undefined) onProgress?.(m.progress); // 旁路信号：分片进度
+      else if (m.chunk !== undefined) {
         partial = m.chunk;
         frame ||= requestAnimationFrame(paint);
       } else if (m.error) finish({ error: m.error, code: m.code });
@@ -584,7 +646,12 @@ async function runSelection(text, range, retryJob = null) {
   // 语种检测是异步的，回来后确认气泡还属于这个任务，别把喇叭按到新的译文上
   const lang = await speakLang(text);
   if (pending !== task) return;
-  showTip(out, { inline: lang ? speakButton(text, lang) : null });
+  // 重译沿用第一次的语境快照并带上 force：后台跳过缓存直接重译
+  const again = { ...job, force: true };
+  showTip(out, {
+    inline: lang ? speakButton(text, lang) : null,
+    actions: [copyAction(() => plainText(out)), retranslateAction(() => runSelection(text, range, again))],
+  });
   // 译文到达后后台可能还在抽术语；保留句柄，让关闭气泡或发起新任务可以中止它。
   task.closed.then(() => {
     if (pending === task) pending = null;
@@ -710,6 +777,7 @@ function encodeInline(block) {
 }
 
 const visibleLength = (text) => stripMarkers(text).length;
+const plainText = (text) => stripMarkers(text).replace(/\s+$/, '').trim(); // 复制用：不带结构标记的纯文本
 
 /** 克隆行内元素时去掉 id 和行内事件：id 不能重复，页面的 onclick 也不该跟着复制一份 */
 function sanitize(node) {
@@ -728,6 +796,7 @@ function sanitize(node) {
  * 最坏情况退化成纯文本（文字仍然完整，只是丢了链接）。
  */
 const rendered = new WeakMap(); // 译文节点 → 上次渲染的原始文本，终稿与最后一帧相同就不再重建
+const progressOf = new WeakMap(); // 译文节点 → 分片进度小字（旁路节点，渲染后放回）
 
 function render(el, text, parts = []) {
   if (rendered.get(el) === text) return;
@@ -780,6 +849,8 @@ function render(el, text, parts = []) {
   // 只吃掉「< + 字母数字」这种形状，正文里的 `5 < 6` 不受影响
   emit(text.slice(last).replace(/<\/?[a-z]*\d*\/?$/i, ''));
   el.replaceChildren(frag);
+  const progress = progressOf.get(el);
+  if (progress) el.prepend(progress); // 渲染整棵重建：进度小字随后放回左上角
 }
 
 /** 创建承载译文的节点，使其与原文渲染样式一致 */
@@ -819,14 +890,14 @@ function blockError(block, target, error, code) {
   }
 }
 
-async function runBlock(block, force) {
+async function runBlock(block, force, pre = null, fresh = false) {
   const done = existingTranslation(block);
   if (done) {
     running.get(done)?.cancel(); // 收起译文 = 立即中止请求，不等下一个分片
     return done.remove();
   }
 
-  const { text: source, parts, tagged } = encodeInline(block); // 必须在插入占位节点之前取
+  const { text: source, parts, tagged } = pre || encodeInline(block); // 热键预启动时编码已在 keydown 完成
   if (!source) return;
   const size = visibleLength(source);
   if (!force && size > LONG_TEXT) {
@@ -840,11 +911,33 @@ async function runBlock(block, force) {
   const surrounding = paragraphContext(block); // 插入译文节点前读取，避免把加载动画当下文
   const target = createTarget(block);
   target.replaceChildren(dots());
-  const job = { kind: 'block', text: source, tagged, page: pageBrief(), surrounding };
-  const task = requestTranslation(job, (p) => {
-    if (target.isConnected) render(target, p, parts);
-    else task.cancel(); // 页面变化导致节点消失，停止请求
-  });
+  const job = { kind: 'block', text: source, tagged, page: pageBrief(), surrounding, force: fresh || undefined };
+  // 分片进度：旁路小字（「x/y」），随分片完成递增，译完移除
+  let progressEl = null;
+  const showProgress = (label, active) => {
+    if (!target.isConnected) return;
+    if (!active) {
+      progressEl?.remove();
+      progressOf.delete(target);
+      progressEl = null;
+      return;
+    }
+    if (!progressEl) {
+      progressEl = document.createElement('span');
+      progressEl.className = 'ai-tr-progress';
+      progressOf.set(target, progressEl);
+      target.prepend(progressEl);
+    }
+    progressEl.textContent = label;
+  };
+  const task = requestTranslation(
+    job,
+    (p) => {
+      if (target.isConnected) render(target, p, parts);
+      else task.cancel(); // 页面变化导致节点消失，停止请求
+    },
+    showProgress
+  );
   running.set(target, task);
   task.closed.then(() => {
     if (running.get(target) === task) running.delete(target);
@@ -853,11 +946,35 @@ async function runBlock(block, force) {
   const { text, error, code, cancelled } = await task;
   if (cancelled) return;
   if (!target.isConnected) return;
+  showProgress('', false); // 进度小字随之消失
   if (error) {
     running.delete(target); // 错误之后没有后台后处理，重试不需要先取消旧任务
     blockError(block, target, error, code);
   }
-  else render(target, text, parts);
+  else {
+    render(target, text, parts);
+    // 终稿之后才挂复制/重译：流式过程中每个分片都会重建正文
+    const bar = document.createElement('span');
+    bar.className = 'ai-tr-actions';
+    const copy = document.createElement('button');
+    copy.className = 'ai-tr-retry';
+    copy.textContent = '复制';
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(plainText(text));
+        copy.textContent = '已复制';
+      } catch {
+        copy.textContent = '复制失败';
+      }
+      setTimeout(() => (copy.textContent = '复制'), 1500);
+    };
+    const again = document.createElement('button');
+    again.className = 'ai-tr-retry';
+    again.textContent = '重译';
+    again.onclick = () => (target.remove(), runBlock(block, true, pre, true)); // 绕过缓存重新翻译
+    bar.append(copy, document.createTextNode(' · '), again);
+    target.append(document.createTextNode(' '), bar);
+  }
 }
 
 /* ---------- 触发：单独按下并松开热键（组合键不触发） ---------- */
@@ -922,13 +1039,43 @@ function previewTarget() {
 function disarm() {
   armedAt = 0;
   highlight(null);
+  // 预启动的划词请求立即中止：不占并发、不消耗额度
+  if (prestarted) {
+    prestarted = null;
+    pending?.cancel();
+    pending = null;
+    hideTip();
+  }
 }
 
-async function trigger() {
+/** keydown 时的预启动快照：划词直接预发请求（按住时长不再挡在请求前面），
+    段落翻译保守一些——只同步完成 encodeInline 编码，keyup 确认后才发。 */
+let prestarted = null;
+
+function prestart() {
+  prestarted = null;
+  const sel = activeSelection();
+  if (sel) {
+    if (alreadyTarget(sel.text)) {
+      const anchor = sel.range ? rangeAnchor(sel.range) : pointAnchor();
+      return flash(anchor, `已经是${cfg.targetLang}`);
+    }
+    prestarted = { sel };
+    return void runSelection(sel.text, sel.range); // 误按由 disarm 中止
+  }
+  const block = candidate();
+  if (!block || alreadyTarget(block.innerText)) return; // keyup 走 trigger() 给出提示
+  if (!block.isConnected || existingTranslation(block)) return; // 收起已有译文等动作，keyup 走原路径
+  const pre = encodeInline(block);
+  if (!pre.text || visibleLength(pre.text) > LONG_TEXT) return; // 超长段要确认，keyup 走原路径
+  prestarted = { block, pre };
+}
+
+function trigger() {
   const sel = activeSelection();
   if (sel) {
     const anchor = sel.range ? rangeAnchor(sel.range) : pointAnchor();
-    if (await alreadyTarget(sel.text)) return flash(anchor, `已经是${cfg.targetLang}`);
+    if (alreadyTarget(sel.text)) return flash(anchor, `已经是${cfg.targetLang}`);
     return runSelection(sel.text, sel.range);
   }
   const block = candidate();
@@ -937,8 +1084,8 @@ async function trigger() {
     if (hovered && !insideTip(hovered)) flash(pointAnchor(), '这里没找到可翻译的段落');
     return;
   }
-  if (await alreadyTarget(block.innerText)) return flash(blockAnchor(block), `已经是${cfg.targetLang}`);
-  if (!block.isConnected) return; // 检测语种的空档里页面可能已经把段落换掉了
+  if (alreadyTarget(block.innerText)) return flash(blockAnchor(block), `已经是${cfg.targetLang}`);
+  if (!block.isConnected) return;
   runBlock(block, false);
 }
 
@@ -961,7 +1108,8 @@ addEventListener(
   'keydown',
   (e) => {
     if (!enabled) return;
-    if (e.key === cfg.hotkey && !e.repeat && !otherModifier(e)) (armedAt = performance.now()), previewTarget();
+    if (e.key === cfg.hotkey && !e.repeat && !otherModifier(e))
+      (armedAt = performance.now()), previewTarget(), prestart();
     else disarm();
   },
   true
@@ -973,8 +1121,18 @@ addEventListener(
     if (e.key === 'Escape') return hideTip();
     if (!enabled || e.key !== cfg.hotkey || !armedAt) return;
     const held = performance.now() - armedAt;
-    disarm();
-    if (held <= HOLD_MAX) trigger();
+    const pre = prestarted;
+    armedAt = 0;
+    highlight(null);
+    prestarted = null;
+    if (held > HOLD_MAX) {
+      // 按住太久是另有用途：预发的划词请求立即中止，不占并发不消耗额度
+      if (pre?.sel) (pending?.cancel(), (pending = null), hideTip());
+      return;
+    }
+    if (pre?.sel) return; // 划词请求已在 keydown 发出，keyup 无事可做
+    if (pre?.block) return pre.block.isConnected && runBlock(pre.block, false, pre.pre);
+    trigger(); // 预启动没建立（超长段、已有译文等）：走原来的确认路径
   },
   true
 );
@@ -988,5 +1146,107 @@ chrome.runtime.onMessage.addListener((msg) => {
   } else if (msg?.type === 'translate-block') {
     const block = findBlock(rightClicked || hovered);
     if (block) runBlock(block, false);
+  } else if (msg?.type === 'translate-page') {
+    translatePage();
+  } else if (msg?.type === 'stopPage') {
+    stopPage();
   }
 });
+
+/* ---------- 整页翻译：收集正文块，视口内按 DOM 顺序有界并发 ---------- */
+
+const PAGE_CONCURRENT = 3; // 同时翻译的段落数；与全局 MAX_CONCURRENT 之外再打一层
+const PAGE_MARGIN = 400; // 视口上下各预留这么多像素，滚动时提前开工
+const PAGE_SKIP_SELECTOR = 'nav,header,footer,aside'; // 路由、页脚这类「每页都一样」的文字没有翻译价值
+
+/** 自顶向下收集「叶子」正文块：还有块级子元素的容器继续拆，自己就是一段的才算数 */
+function collectBlocks(root, out) {
+  for (const child of root.children) {
+    if (SKIP.test(child.tagName) || child.dataset?.[MARK] || child.closest(PAGE_SKIP_SELECTOR)) continue;
+    const style = getComputedStyle(child);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    if (style.position === 'fixed' || style.position === 'sticky') continue; // 悬浮条
+    let blockChild = false;
+    for (const gc of child.children) {
+      const d = getComputedStyle(gc).display;
+      if (d !== 'inline' && d !== 'contents' && d !== 'none') {
+        blockChild = true;
+        break;
+      }
+    }
+    if (blockChild) collectBlocks(child, out);
+    else if (child.innerText?.trim().length >= 8) out.push(child);
+  }
+}
+
+let pageJob = null; // { blocks, running, active }
+
+/** 取下一个该开工的块：已收走/已译的跳过；离视口太远的留给滚动触发 */
+function nextPageBlock() {
+  const blocks = pageJob?.blocks || [];
+  while (blocks.length) {
+    const block = blocks[0];
+    if (!block.isConnected || existingTranslation(block)) {
+      blocks.shift();
+      continue;
+    }
+    const r = block.getBoundingClientRect();
+    if (r.top > innerHeight + PAGE_MARGIN) return null; // 还没滚到，等下次
+    blocks.shift();
+    return block;
+  }
+  return null;
+}
+
+function pumpPage() {
+  if (!pageJob?.active) return;
+  while (pageJob.running < PAGE_CONCURRENT) {
+    const block = nextPageBlock();
+    if (!block) {
+      if (!pageJob.running) stopPage(); // 全部译完，自动收摊
+      return;
+    }
+    pageJob.running++;
+    Promise.resolve(runBlock(block, false))
+      .catch(() => {})
+      .finally(() => {
+        if (pageJob) pageJob.running--;
+        pumpPage();
+      });
+  }
+}
+
+async function translatePage() {
+  if (pageJob) {
+    // 正在整页翻译时再点右键菜单：给一个停止入口，而不是毫无反应
+    return showTip('整页翻译进行中。', {
+      hint: true,
+      actions: [{ label: '停止', onClick: () => (hideTip(), stopPage()) }],
+    });
+  }
+  const blocks = [];
+  collectBlocks(document.body, blocks);
+  if (!blocks.length) return flash(pointAnchor(), '这一页没有找到可翻译的段落');
+  openAt(pointAnchor());
+  // 费用提示先确认再发：整页翻译是成十次的请求
+  showTip(`准备翻译这一页的 ${blocks.length} 段，会消耗较多额度。`, {
+    hint: true,
+    actions: [
+      {
+        label: '开始翻译',
+        onClick: () => {
+          hideTip();
+          pageJob = { blocks: blocks.filter((b) => !existingTranslation(b)), active: true, running: 0 };
+          addEventListener('scroll', pumpPage, { passive: true });
+          pumpPage();
+        },
+      },
+    ],
+  });
+}
+
+function stopPage() {
+  if (!pageJob) return;
+  pageJob = null;
+  removeEventListener('scroll', pumpPage);
+}

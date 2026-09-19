@@ -1,0 +1,9 @@
+{
+  "name": "ai-translator-in-web",
+  "private": true,
+  "description": "划词即译的 Chrome 扩展（MV3）——开发脚本",
+  "scripts": {
+    "test": "node --test tools/test.js",
+    "eval": "node tools/eval.js"
+  }
+}
