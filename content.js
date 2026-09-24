@@ -777,7 +777,7 @@ function encodeInline(block) {
 }
 
 const visibleLength = (text) => stripMarkers(text).length;
-const plainText = (text) => stripMarkers(text).replace(/\s+$/, '').trim(); // 复制用：不带结构标记的纯文本
+const plainText = (text) => stripEmptyTags(stripMarkers(text)).replace(/\s+$/, '').trim(); // 复制用：不带结构标记和空标签残渣的纯文本
 
 /** 克隆行内元素时去掉 id 和行内事件：id 不能重复，页面的 onclick 也不该跟着复制一份 */
 function sanitize(node) {
@@ -801,9 +801,10 @@ const progressOf = new WeakMap(); // 译文节点 → 分片进度小字（旁�
 function render(el, text, parts = []) {
   if (rendered.get(el) === text) return;
   rendered.set(el, text);
-  // 先把模型写歪的标记归一，再吃掉紧挨着标记的那一个换行
+  // 先把模型写歪的标记归一、剔掉它改写出来的 HTML 空标签（<a name="1"></a> 这类），
+  // 再吃掉紧挨着标记的那一个换行
   //（只吃一个：模型多打的空行留着，宁可多一行也不少一行）
-  text = normalizeMarkers(text)
+  text = stripEmptyTags(normalizeMarkers(text))
     .replace(NL_BEFORE_BREAK, '$1')
     .replace(NL_AFTER_BREAK, '$1');
   const frag = document.createDocumentFragment();
@@ -833,21 +834,24 @@ function render(el, text, parts = []) {
       if (kind === 'b') emit('\n');
       continue;
     }
-    if (kind === 'x' || selfClose) {
-      push(sanitize(src.cloneNode(true)));
+    if (close) {
+      // 闭合标记只负责退栈；x / 自闭合标记从未进栈（模型把 <x1/> 写成 <x1></x1>
+      // 时多出来的闭合不能再克隆一次元素），直接忽略
+      if (stack.length > 1) stack.pop();
       continue;
     }
-    if (close) {
-      if (stack.length > 1) stack.pop();
+    if (kind === 'x' || selfClose) {
+      push(sanitize(src.cloneNode(true)));
       continue;
     }
     const wrap = sanitize(src.cloneNode(false)); // 浅克隆：保留 href/class，内容由译文填
     push(wrap);
     stack.push(wrap);
   }
-  // 尾部可能是半个标记（`<t1`、`<br` 还没传完），别把它当正文显示出来。
+  // 尾部可能是半个标记（`<t1`、`<br` 还没传完）或半个带属性的 HTML 标签
+  //（`<a name="1">` 还没等到闭合），别把它当正文显示出来。
   // 只吃掉「< + 字母数字」这种形状，正文里的 `5 < 6` 不受影响
-  emit(text.slice(last).replace(/<\/?[a-z]*\d*\/?$/i, ''));
+  emit(text.slice(last).replace(/<\/?[a-z]*\d*\/?$|<\/?[a-z]+\s[^<>]*\/?>?$/i, ''));
   el.replaceChildren(frag);
   const progress = progressOf.get(el);
   if (progress) el.prepend(progress); // 渲染整棵重建：进度小字随后放回左上角

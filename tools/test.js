@@ -95,6 +95,34 @@ test('模型漏掉行内标记时退化成纯文本，文字不丢', () => {
   assert.equal(render('点这里', [el('a')]), '点这里');
 });
 
+/* ---------- render：模型把占位标记改写成真实 HTML ---------- */
+
+test('模型把占位标记改写成 HTML 空标签时剔掉，不当正文显示', () => {
+  // 页面里的空锚点会被编码成 <x1/>，模型偶尔「改写」回真实标签吐回来；
+  // 空标签在页面里本来就不渲染任何内容，混进译文只剩干扰
+  assert.equal(render('<a name="1"></a>休个假吧，好好赏月，好好放松。'), '休个假吧，好好赏月，好好放松。');
+  assert.equal(render('A。<span></span>B。'), 'A。B。', '空标签对一律剔除');
+  assert.equal(render('<a name="1"> </a>甲'), '甲', '标签里只有空白也算空标签');
+  assert.equal(render('<a name="1"/>甲'), '甲', '自闭合空标签同样剔除');
+  assert.equal(render('大家中秋快乐！'), '大家中秋快乐！', '没有标签残渣的译文原样保留');
+});
+
+test('正文里的标签和结构标记不被空标签剔除误伤', () => {
+  assert.equal(render('写一个 <div> 标签'), '写一个 <div> 标签', '没有闭合的正文标签照常保留');
+  assert.equal(render('泛型写成 List<T1> 就行', [el('a')]), '泛型写成 List<T1> 就行', '大写泛型不是标记也不是空标签对');
+  const code = el('code', { class: 'k' });
+  code.append(el('span'));
+  assert.equal(render('<x1></x1>运行', [code]), '<code class="k"><span></span></code>运行', '占位标记的空对要照常还原');
+});
+
+test('stripEmptyTags 在归一之后剔除，<br> 不被误删', () => {
+  // 与 translateOne 里的清洗顺序一致：先 normalizeMarkers 再 stripEmptyTags
+  assert.equal(
+    background.read(`stripEmptyTags(normalizeMarkers('A。<br><a name="1"></a>B。'))`),
+    'A。<n0/>B。'
+  );
+});
+
 /* ---------- 长段落分片 ---------- */
 
 const { splitChunks, breakpoints } = background;
