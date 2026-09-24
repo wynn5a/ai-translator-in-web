@@ -787,7 +787,11 @@ function gateDraft(sub, onChunk) {
  */
 async function translateOne(cfg, sub, onChunk, signal) {
   let shown = false; // 首稿有没有真的上过屏：被押住的首稿没有
-  const out = await request(cfg, sub, gateDraft(sub, (text) => ((shown = true), onChunk(text))), signal);
+  // 先归一并剔掉模型改写出来的 HTML 空标签（<x1/> → <a name="1"></a>）：
+  // 这种元素在页面里什么也不渲染，混进完整性检查、缓存和复制里只剩干扰
+  const out = stripEmptyTags(
+    normalizeMarkers(await request(cfg, sub, gateDraft(sub, (text) => ((shown = true), onChunk(text))), signal))
+  );
   // 语言漂移先于其他检查：语言错了的译文不值得为它修别的问题。
   // 只查正文两类：查词允许专有名词原样返回，没有「整段」可查；已经修过语言的不再重修
   let settled = out;

@@ -24,6 +24,20 @@ function normalizeMarkers(text) {
     });
 }
 
+const EMPTY_PAIR_PATTERN = /<(?![txbn]\d)([a-z][a-z0-9]*)(?:\s[^<>]*)?>\s*<\/\1>/g;
+const EMPTY_SELF_CLOSING_PATTERN = /<(?![txbn]\d)[a-z][a-z0-9]*(?:\s[^<>]*)?\/>/g;
+
+/**
+ * 模型偶尔会把不可翻译的占位标记「改写」成真实的 HTML 标签吐回来
+ * （<x1/> → <a name="1"></a>）。空标签对和自闭合空标签在页面里本来
+ * 就不渲染任何内容，混进译文只剩干扰：直接剔除。正文里讨论的
+ * <div>、List<T1> 不是空标签对，不受影响；结构标记也不在此列。
+ * 调用前先 normalizeMarkers：<br> 已归一成 <n0/>，不会被这里误删。
+ */
+function stripEmptyTags(text) {
+  return text.replace(EMPTY_PAIR_PATTERN, '').replace(EMPTY_SELF_CLOSING_PATTERN, '');
+}
+
 /** 遍历规范标记；每次返回独立迭代器，不向调用方暴露正则的 lastIndex。 */
 function markerMatches(text) {
   return text.matchAll(MARKER_PATTERN);

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI 划词翻译",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "选中文字或悬停段落后按 Ctrl，用 OpenAI 兼容模型即时翻译。",
   "minimum_chrome_version": "116",
   "permissions": ["storage", "contextMenus", "offscreen"],
